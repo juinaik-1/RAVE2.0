@@ -53,37 +53,6 @@ export function useChat({ roomId, channel, displayName, userId }) {
           setMessages((current) => [...current, nextMessage].slice(-100));
         },
       )
-      .on('broadcast', { event: 'chat:message' }, ({ payload }) => {
-        if (!payload) {
-          return;
-        }
-
-        const message = toListMessage({
-          ...payload,
-          user_id: payload.user_id || payload.name || 'guest',
-          room_id: roomId,
-          created_at: payload.created_at || new Date().toISOString(),
-        });
-
-        setMessages((current) => [...current, message].slice(-100));
-      })
-      .on('broadcast', { event: 'chat:notice' }, ({ payload }) => {
-        if (!payload?.text) {
-          return;
-        }
-
-        const notice = {
-          id: `notice-${Date.now()}-${Math.random()}`,
-          room_id: roomId,
-          name: 'System',
-          text: payload.text,
-          created_at: new Date().toISOString(),
-          type: 'system',
-          user_id: 'system',
-        };
-
-        setMessages((current) => [...current, notice].slice(-100));
-      })
       .subscribe();
 
     return () => {
@@ -116,23 +85,6 @@ export function useChat({ roomId, channel, displayName, userId }) {
     }
 
     const cleanedText = messageText.slice(0, 500);
-    const payload = {
-      room_id: roomId,
-      name: displayName || 'Guest',
-      text: cleanedText,
-      created_at: new Date().toISOString(),
-      user_id: userId,
-    };
-
-    if (channel) {
-      channel.send({
-        type: 'broadcast',
-        event: 'chat:message',
-        payload,
-      });
-    }
-
-    setMessages((current) => [...current, toListMessage({ ...payload, id: `local-${Date.now()}` })].slice(-100));
 
     if (supabase) {
       try {
@@ -144,7 +96,19 @@ export function useChat({ roomId, channel, displayName, userId }) {
           },
         ]);
       } catch (error) {
-        // Fail silently because broadcast delivery is still live even if the table is unavailable.
+        // The database insert is the single source of truth; fall back to local display only if it fails.
+        setMessages((current) => [
+          ...current,
+          toListMessage({
+            room_id: roomId,
+            name: displayName || 'Guest',
+            text: cleanedText,
+            created_at: new Date().toISOString(),
+            user_id: userId,
+            type: 'chat',
+            id: `local-fallback-${Date.now()}-${Math.random()}`,
+          }),
+        ].slice(-100));
       }
     }
   };

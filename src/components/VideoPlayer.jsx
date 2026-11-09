@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import ReactPlayer from 'react-player';
-import { isGoogleDriveLink, normalizeVideoUrl } from '../utils/videoUrl';
+import { convertApi } from '../utils/convertApi';
+import { isDirectPlayableVideo, isGoogleDriveLink, normalizeVideoUrl } from '../utils/videoUrl';
 
 export default function VideoPlayer({
   url,
@@ -16,10 +17,58 @@ export default function VideoPlayer({
   onDuration,
   onLoadVideo,
   onVideoError,
+  onReady,
 }) {
   const [inputValue, setInputValue] = useState(url || '');
   const [localError, setLocalError] = useState('');
   const playerRef = useRef(null);
+  const playbackRetryRef = useRef(0);
+
+  const tryResumePlayback = () => {
+    if (!playerRef.current) {
+      return;
+    }
+
+    const internalPlayer = playerRef.current.getInternalPlayer?.();
+
+    if (internalPlayer && typeof internalPlayer.play === 'function') {
+      internalPlayer.play();
+      return;
+    }
+
+    if (internalPlayer && typeof internalPlayer.playVideo === 'function') {
+      internalPlayer.playVideo();
+      return;
+    }
+
+    if (typeof playerRef.current.play === 'function') {
+      playerRef.current.play();
+    }
+  };
+
+  useEffect(() => {
+    if (!playerRef.current || !playing || !url) {
+      return;
+    }
+
+    playbackRetryRef.current += 1;
+    const attemptId = playbackRetryRef.current;
+
+    const resume = () => {
+      if (attemptId !== playbackRetryRef.current) {
+        return;
+      }
+      tryResumePlayback();
+    };
+
+    const timeouts = [
+      window.setTimeout(resume, 150),
+      window.setTimeout(resume, 500),
+      window.setTimeout(resume, 1200),
+    ];
+
+    return () => timeouts.forEach((timer) => window.clearTimeout(timer));
+  }, [url, playing]);
 
   useEffect(() => {
     setInputValue(url || '');
@@ -36,16 +85,59 @@ export default function VideoPlayer({
     }
   }, [time]);
 
-  const handleSubmit = (event) => {
+  const handleSubmit = async (event) => {
     event.preventDefault();
-    const normalizedUrl = normalizeVideoUrl(inputValue);
+    const rawValue = (inputValue || '').trim();
+    const normalizedUrl = normalizeVideoUrl(rawValue);
 
     if (!normalizedUrl) {
       setLocalError('Please enter a valid video URL.');
       return;
     }
 
+    if (isDirectPlayableVideo(normalizedUrl)) {
+      setLocalError('');
+      setInputValue(normalizedUrl);
+      onLoadVideo?.(normalizedUrl);
+      return;
+    }
+
+    if (isGoogleDriveLink(rawValue)) {
+      try {
+        setLocalError('Converting Google Drive link…');
+
+        const result = await convertApi.post('/api/jobs', { url: rawValue });
+        const jobId = result?.jobId || result?.id;
+        if (!jobId) {
+          throw new Error('The conversion service did not return a job ID.');
+        }
+
+        let finalStatus = null;
+        for (let attempt = 0; attempt < 60; attempt += 1) {
+          const job = await convertApi.get(`/api/jobs/${jobId}`);
+          if (['done', 'failed', 'cancelled'].includes(job?.status)) {
+            finalStatus = job;
+            break;
+          }
+          await new Promise((resolve) => window.setTimeout(resolve, 2000));
+        }
+
+        if (!finalStatus || finalStatus.status !== 'done' || !finalStatus.outputUrl) {
+          throw new Error(finalStatus?.error || 'Google Drive conversion did not finish.');
+        }
+
+        setLocalError('');
+        setInputValue(finalStatus.outputUrl);
+        onLoadVideo?.(finalStatus.outputUrl);
+        return;
+      } catch (error) {
+        setLocalError(error.message || 'Google Drive conversion failed.');
+        return;
+      }
+    }
+
     setLocalError('');
+    setInputValue(normalizedUrl);
     onLoadVideo?.(normalizedUrl);
   };
 
@@ -56,19 +148,46 @@ export default function VideoPlayer({
       <div className="video-shell">
         {url ? (
           <ReactPlayer
+            key={url}
             ref={playerRef}
             url={url}
             playing={playing}
             controls
+            playsinline
+            config={{
+              youtube: {
+                playerVars: {
+                  autoplay: 1,
+                  playsinline: 1,
+                  rel: 0,
+                  controls: 1,
+                },
+              },
+              file: {
+                attributes: {
+                  autoPlay: true,
+                  controls: true,
+                },
+              },
+            }}
             width="100%"
             height="100%"
             onReady={() => {
               if (playerRef.current && typeof playerRef.current.seekTo === 'function') {
                 playerRef.current.seekTo(time, 'seconds');
               }
+
+              if (playing) {
+                window.setTimeout(() => {
+                  tryResumePlayback();
+                }, 150);
+              }
+
+              onReady?.();
             }}
             onPlay={() => onPlayPause?.(true)}
             onPause={() => onPlayPause?.(false)}
+            onEnded={() => onPlayPause?.(false)}
             onProgress={(state) => {
               const seconds = Number(state.playedSeconds || 0);
               onProgress?.(seconds);

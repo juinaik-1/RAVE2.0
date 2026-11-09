@@ -109,10 +109,12 @@ export function useVideoSync({ roomId, channel, isHost, canControl, send }) {
     channel.on('broadcast', { event: 'video:reply' }, handleReply);
 
     return () => {
-      channel.off('broadcast', { event: 'video:load' }, handleLoad);
-      channel.off('broadcast', { event: 'video:state' }, handleState);
-      channel.off('broadcast', { event: 'video:request_state' }, handleRequest);
-      channel.off('broadcast', { event: 'video:reply' }, handleReply);
+      if (channel && typeof channel.off === 'function') {
+        channel.off('broadcast', { event: 'video:load' }, handleLoad);
+        channel.off('broadcast', { event: 'video:state' }, handleState);
+        channel.off('broadcast', { event: 'video:request_state' }, handleRequest);
+        channel.off('broadcast', { event: 'video:reply' }, handleReply);
+      }
     };
   }, [channel, roomId, send, time, videoUrl, playing]);
 
@@ -144,6 +146,12 @@ export function useVideoSync({ roomId, channel, isHost, canControl, send }) {
     });
   };
 
+  const handleReady = () => {
+    setLoading(false);
+    setError('');
+    setPlaying(true);
+  };
+
   const loadVideo = (nextUrl) => {
     if (!canControl) {
       return;
@@ -154,12 +162,12 @@ export function useVideoSync({ roomId, channel, isHost, canControl, send }) {
     setError('');
     setVideoUrl(normalized);
     setTime(0);
-    setPlaying(false);
+    setPlaying(true);
     send('video:load', {
       roomId,
       url: normalized,
       time: 0,
-      playing: false,
+      playing: true,
     });
   };
 
@@ -212,6 +220,7 @@ export function useVideoSync({ roomId, channel, isHost, canControl, send }) {
     loading,
     error,
     loadVideo,
+    handleReady,
     handlePlayPause,
     handleSeek,
     handleProgress,

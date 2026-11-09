@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { useNavigate, useParams } from 'react-router-dom';
+import { useLocation, useNavigate, useParams } from 'react-router-dom';
 import Chat from '../components/Chat';
 import UserList from '../components/UserList';
 import VideoPlayer from '../components/VideoPlayer';
@@ -13,6 +13,7 @@ const DISPLAY_NAME_KEY = 'rave-display-name';
 
 export default function Room() {
   const navigate = useNavigate();
+  const location = useLocation();
   const { roomId } = useParams();
   const roomKey = (roomId || '').trim().toUpperCase();
   const storedName =
@@ -48,6 +49,15 @@ export default function Room() {
     canControl,
     send,
   });
+
+  useEffect(() => {
+    const params = new URLSearchParams(location.search);
+    const remoteVideo = params.get('video');
+    if (remoteVideo) {
+      video.loadVideo(remoteVideo);
+      navigate(`/room/${roomKey}`, { replace: true });
+    }
+  }, [location.search, navigate, roomKey, video]);
 
   const chat = useChat({ roomId: roomKey, channel, displayName, userId });
   const voice = useVoice({
@@ -129,6 +139,7 @@ export default function Room() {
             onProgress={video.handleProgress}
             onDuration={video.handleDuration}
             onLoadVideo={video.loadVideo}
+            onReady={video.handleReady}
             onVideoError={video.handleVideoError}
           />
 

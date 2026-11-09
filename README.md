@@ -46,6 +46,8 @@ VITE_SUPABASE_ANON_KEY=your-anon-key
 VITE_TURN_URL=turn:relay.metered.ca:80
 VITE_TURN_USERNAME=your-turn-username
 VITE_TURN_CREDENTIAL=your-turn-credential
+VITE_CONVERT_API_URL=https://your-oracle-backend.example.com
+VITE_CONVERT_API_KEY=your-backend-api-key
 ```
 
 The TURN variables are optional. Google STUN is included automatically.
@@ -125,6 +127,8 @@ create policy "Anonymous can insert room messages"
    - `VITE_TURN_URL`
    - `VITE_TURN_USERNAME`
    - `VITE_TURN_CREDENTIAL`
+   - `VITE_CONVERT_API_URL`
+   - `VITE_CONVERT_API_KEY`
 5. Deploy.
 
 The app is static and works with the provided `vercel.json` SPA rewrite.
