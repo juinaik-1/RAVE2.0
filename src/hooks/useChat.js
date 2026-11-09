@@ -17,6 +17,54 @@ export function useChat({ roomId, channel, displayName, userId }) {
   const [messages, setMessages] = useState([]);
 
   useEffect(() => {
+    if (!roomId || !channel) {
+      return;
+    }
+
+    const handleMessage = ({ payload }) => {
+      if (!payload) {
+        return;
+      }
+
+      const message = toListMessage({
+        ...payload,
+        user_id: payload.user_id || payload.name || 'guest',
+        room_id: roomId,
+        created_at: payload.created_at || new Date().toISOString(),
+      });
+
+      setMessages((current) => [...current, message].slice(-100));
+    };
+
+    const handleNotice = ({ payload }) => {
+      if (!payload?.text) {
+        return;
+      }
+
+      const notice = {
+        id: `notice-${Date.now()}-${Math.random()}`,
+        room_id: roomId,
+        name: 'System',
+        text: payload.text,
+        created_at: new Date().toISOString(),
+        type: 'system',
+        user_id: 'system',
+      };
+      setMessages((current) => [...current, notice].slice(-100));
+    };
+
+    channel.on('broadcast', { event: 'chat:message' }, handleMessage);
+    channel.on('broadcast', { event: 'chat:notice' }, handleNotice);
+
+    return () => {
+      if (typeof channel.off === 'function') {
+        channel.off('broadcast', { event: 'chat:message' }, handleMessage);
+        channel.off('broadcast', { event: 'chat:notice' }, handleNotice);
+      }
+    };
+  }, [channel, roomId]);
+
+  useEffect(() => {
     if (!roomId || !supabase) {
       return;
     }
@@ -85,30 +133,43 @@ export function useChat({ roomId, channel, displayName, userId }) {
     }
 
     const cleanedText = messageText.slice(0, 500);
+    const payload = {
+      room_id: roomId,
+      name: displayName || 'Guest',
+      text: cleanedText,
+      created_at: new Date().toISOString(),
+      user_id: userId,
+    };
+
+    const showLocalFallback = () => {
+      if (channel) {
+        channel.send({
+          type: 'broadcast',
+          event: 'chat:message',
+          payload,
+        });
+      }
+
+      setMessages((current) => [
+        ...current,
+        toListMessage({ ...payload, id: `local-fallback-${Date.now()}-${Math.random()}` }),
+      ].slice(-100));
+    };
 
     if (supabase) {
       try {
-        await supabase.from('messages').insert([
+        const { error } = await supabase.from('messages').insert([
           {
             room_id: roomId,
             name: displayName || 'Guest',
             text: cleanedText,
           },
         ]);
+        if (error) {
+          showLocalFallback();
+        }
       } catch (error) {
-        // The database insert is the single source of truth; fall back to local display only if it fails.
-        setMessages((current) => [
-          ...current,
-          toListMessage({
-            room_id: roomId,
-            name: displayName || 'Guest',
-            text: cleanedText,
-            created_at: new Date().toISOString(),
-            user_id: userId,
-            type: 'chat',
-            id: `local-fallback-${Date.now()}-${Math.random()}`,
-          }),
-        ].slice(-100));
+        showLocalFallback();
       }
     }
   };

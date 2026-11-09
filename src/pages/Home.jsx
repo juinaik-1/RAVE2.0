@@ -88,7 +88,6 @@ export default function Home() {
               Join room
             </button>
           </div>
-
         </div>
       </div>
     </div>
