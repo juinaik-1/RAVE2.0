@@ -1,152 +1,166 @@
 import crypto from 'node:crypto';
 import dns from 'node:dns/promises';
 import fs from 'node:fs';
+import http from 'node:http';
+import net from 'node:net';
+import path from 'node:path';
+import { config } from './config.js';
 
-const BLOCKED_NETWORKS = [
-  '10.0.0.0/8',
-  '127.0.0.0/8',
-  '169.254.0.0/16',
-  '172.16.0.0/12',
-  '192.168.0.0/16',
-  '::1',
-  'fc00::/7',
-  'fe80::/10',
+const BLOCKED_IPV4 = [
+  ['0.0.0.0', 8], ['10.0.0.0', 8], ['100.64.0.0', 10], ['127.0.0.0', 8],
+  ['169.254.0.0', 16], ['172.16.0.0', 12], ['192.0.0.0', 24], ['192.0.2.0', 24],
+  ['192.168.0.0', 16], ['198.18.0.0', 15], ['198.51.100.0', 24], ['203.0.113.0', 24],
+  ['224.0.0.0', 4], ['240.0.0.0', 4],
 ];
 
-function ipToBigInt(ip) {
-  const parsed = ip.includes(':') ? ip : ip.split('.');
-  if (parsed === ip) {
-    const [high, low] = ip.split('::');
-    const groups = high ? high.split(':').filter(Boolean) : [];
-    const raw = [...groups, ...Array(8 - groups.length).fill('0')];
-    const expanded = raw.map((value) => value.padStart(4, '0')).join('');
-    return BigInt('0x' + expanded);
-  }
+function ipv4Number(address) {
+  return address.split('.').reduce((value, part) => (value * 256) + Number(part), 0);
+}
 
-  let value = 0n;
-  for (const octet of parsed) {
-    value = (value << 8n) + BigInt(Number(octet));
-  }
-  return value;
+function inIpv4Range(address, network, prefix) {
+  const shift = 32 - prefix;
+  return Math.floor(ipv4Number(address) / (2 ** shift)) === Math.floor(ipv4Number(network) / (2 ** shift));
 }
 
 function isBlockedAddress(address) {
-  if (!address) {
+  if (net.isIPv4(address)) {
+    return BLOCKED_IPV4.some(([network, prefix]) => inIpv4Range(address, network, prefix));
+  }
+  if (!net.isIPv6(address)) return true;
+  const normalized = address.toLowerCase().split('%')[0];
+  if (normalized.startsWith('::ffff:')) {
+    const embedded = normalized.slice(7);
+    if (net.isIPv4(embedded)) return isBlockedAddress(embedded);
     return true;
   }
-
-  const ip = address.trim();
-  if (ip.includes(':')) {
-    const ipv6 = ip.split('%')[0];
-    if (ipv6 === '::1') {
-      return true;
-    }
-    return BLOCKED_NETWORKS.some((network) => {
-      if (!network.includes(':')) {
-        return false;
-      }
-      const [networkIp, prefixLengthText] = network.split('/');
-      const prefixLength = Number(prefixLengthText || 128);
-      const networkValue = ipToBigInt(networkIp);
-      const targetValue = ipToBigInt(ipv6);
-      const shift = 128n - BigInt(prefixLength);
-      return (networkValue === (targetValue >> shift << shift));
-    });
-  }
-
-  const parts = ip.split('.');
-  if (parts.length !== 4) {
-    return true;
-  }
-
-  const target = parts.map((part) => Number(part)).join('.');
-  if (target === '127.0.0.1') {
-    return true;
-  }
-
-  return BLOCKED_NETWORKS.some((network) => {
-    if (network.includes(':')) {
-      return false;
-    }
-    const [networkIp, prefixText] = network.split('/');
-    const prefix = Number(prefixText || 32);
-    const targetValue = ipToBigInt(ip);
-    const networkValue = ipToBigInt(networkIp);
-    const shift = 32n - BigInt(prefix);
-    return (networkValue === (targetValue >> shift << shift));
-  });
-}
-
-export function isValidJobId(value) {
-  return typeof value === 'string' && /^[a-zA-Z0-9]+$/.test(value);
-}
-
-export function isValidMp4Name(value) {
-  return typeof value === 'string' && /^[a-zA-Z0-9.-]+\.mp4$/i.test(value);
-}
-
-export function validateApiKey(candidate, expected) {
-  if (!candidate || !expected) {
-    return false;
-  }
-
-  const expectedBuffer = Buffer.from(expected);
-  const candidateBuffer = Buffer.from(candidate);
-  if (candidateBuffer.length !== expectedBuffer.length) {
-    return false;
-  }
-
-  return crypto.timingSafeEqual(expectedBuffer, candidateBuffer);
+  return !normalized.startsWith('2') && !normalized.startsWith('3')
+    || normalized.startsWith('2001:db8:');
 }
 
 export function validateUrl(value) {
-  if (!value || typeof value !== 'string') {
-    throw new Error('A media URL is required.');
+  if (typeof value !== 'string' || !value.trim() || value.length > 2048) {
+    throw new Error('A source URL is required and must be at most 2048 characters.');
   }
-
-  const parsed = new URL(value);
-  if (!['http:', 'https:'].includes(parsed.protocol)) {
-    throw new Error('Only HTTP or HTTPS uploads are allowed.');
+  let parsed;
+  try {
+    parsed = new URL(value);
+  } catch {
+    throw new Error('Enter a valid HTTP or HTTPS URL.');
   }
-
+  if (!['http:', 'https:'].includes(parsed.protocol) || parsed.username || parsed.password) {
+    throw new Error('Only credential-free HTTP or HTTPS URLs are allowed.');
+  }
   return parsed;
 }
 
-export async function resolveTargetAndBlockPrivateHosts(urlValue) {
-  const parsed = validateUrl(urlValue);
-  const addresses = await dns.lookup(parsed.hostname, { all: true });
-
-  if (!addresses || !addresses.length) {
-    throw new Error('The host could not be resolved.');
+export async function resolveTargetAndBlockPrivateHosts(value) {
+  const parsed = validateUrl(value);
+  const hostname = parsed.hostname.replace(/^\[|\]$/g, '');
+  const literal = net.isIP(hostname);
+  const addresses = literal
+    ? [{ address: hostname, family: literal }]
+    : await dns.lookup(hostname, { all: true, verbatim: true });
+  if (!addresses.length || addresses.some(({ address }) => isBlockedAddress(address))) {
+    throw new Error('The target URL resolves to a private or blocked network address.');
   }
-
-  for (const addressInfo of addresses) {
-    if (isBlockedAddress(addressInfo.address)) {
-      throw new Error('The target URL resolves to a private or blocked network address.');
-    }
-  }
-
-  return {
-    parsed,
-    resolvedIps: addresses.map((item) => item.address),
-  };
+  return { parsed, resolvedIps: addresses.map(({ address }) => address) };
 }
 
-export function ensureFreeDiskSpace(requiredBytes) {
-  try {
-    const stats = fs.statfsSync('/');
-    const availableBytes = stats.bavail * stats.bsize;
-    const requestedBytes = Number(requiredBytes || 0);
-    const safetyBufferBytes = 512 * 1024 * 1024;
-    const minimumRequired = Math.max(requestedBytes, safetyBufferBytes);
-
-    if (minimumRequired > 0 && availableBytes < minimumRequired) {
-      throw new Error('Not enough free disk space to download and convert this file.');
-    }
-  } catch (error) {
-    if (error && error.code === 'ENOENT') {
-      return;
-    }
-    throw error;
+export function ensureFreeDiskSpace(requiredBytes, directoryPath) {
+  fs.mkdirSync(directoryPath, { recursive: true });
+  const stats = fs.statfsSync(directoryPath);
+  const availableBytes = stats.bavail * stats.bsize;
+  const minimumRequired = Number(requiredBytes || 0) + 512 * 1024 * 1024;
+  if (availableBytes < minimumRequired) {
+    throw new Error('Not enough free disk space to download and convert this file.');
   }
+}
+
+export function isValidJobId(value) {
+  return typeof value === 'string' && /^[a-f0-9]{32}$/.test(value);
+}
+
+export function isValidStreamId(value) {
+  return typeof value === 'string' && /^[a-f0-9]{32}$/.test(value);
+}
+
+export function createJobId() {
+  return crypto.randomBytes(16).toString('hex');
+}
+
+export function resolveDownloadPath(fileName) {
+  if (typeof fileName !== 'string' || !/^[a-f0-9]{32}\.mp4$/.test(fileName)) {
+    return null;
+  }
+  const resolved = path.resolve(config.downloadDir, fileName);
+  return path.dirname(resolved) === path.resolve(config.downloadDir) ? resolved : null;
+}
+
+export function startSafeProxy() {
+  const proxy = http.createServer(async (req, res) => {
+    let target;
+    try {
+      target = validateUrl(req.url);
+      const port = Number(target.port || (target.protocol === 'https:' ? 443 : 80));
+      if (![80, 443].includes(port) || (target.protocol === 'https:' && port !== 443)) {
+        throw new Error('Only standard HTTP and HTTPS ports are allowed.');
+      }
+      const { resolvedIps } = await resolveTargetAndBlockPrivateHosts(target.href);
+      const address = resolvedIps[0];
+      const transport = target.protocol === 'https:' ? await import('node:https') : await import('node:http');
+      const upstream = transport.default.request(target.href, {
+        method: req.method,
+        headers: { ...req.headers, host: target.host, connection: 'close' },
+        agent: false,
+        lookup: (_hostname, _options, callback) => callback(null, address, net.isIP(address)),
+      }, (upstreamResponse) => {
+        res.writeHead(upstreamResponse.statusCode || 502, upstreamResponse.headers);
+        upstreamResponse.pipe(res);
+      });
+      upstream.on('error', () => {
+        if (!res.headersSent) res.writeHead(502);
+        res.end('Upstream request failed');
+      });
+      req.pipe(upstream);
+      req.on('aborted', () => upstream.destroy());
+    } catch {
+      res.writeHead(403, { Connection: 'close' });
+      res.end('Target URL is not allowed');
+    }
+  });
+
+  proxy.on('connect', async (req, client, head) => {
+    try {
+      const separator = req.url.lastIndexOf(':');
+      const hostname = req.url.slice(0, separator).replace(/^\[|\]$/g, '');
+      const portText = req.url.slice(separator + 1);
+      const port = Number(portText || 443);
+      if (![80, 443].includes(port) || !hostname) throw new Error('Invalid CONNECT target.');
+      const urlHostname = hostname.includes(':') ? `[${hostname}]` : hostname;
+      const parsed = new URL(`https://${urlHostname}/`);
+      const { resolvedIps } = await resolveTargetAndBlockPrivateHosts(parsed.href);
+      const upstream = net.connect(port, resolvedIps[0]);
+      upstream.once('connect', () => {
+        client.write('HTTP/1.1 200 Connection Established\r\n\r\n');
+        if (head.length) upstream.write(head);
+        upstream.pipe(client);
+        client.pipe(upstream);
+      });
+      upstream.on('error', () => client.destroy());
+      client.on('error', () => upstream.destroy());
+    } catch {
+      client.end('HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n');
+    }
+  });
+
+  return new Promise((resolve, reject) => {
+    proxy.once('error', reject);
+    proxy.listen(0, '127.0.0.1', () => {
+      proxy.removeListener('error', reject);
+      resolve({
+        url: `http://127.0.0.1:${proxy.address().port}`,
+        close: () => new Promise((closed) => proxy.close(closed)),
+      });
+    });
+  });
 }

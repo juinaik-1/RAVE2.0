@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { supabase } from '../supabase';
 
 function toListMessage(message) {
@@ -17,12 +17,17 @@ export function useChat({ roomId, channel, displayName, userId }) {
   const [messages, setMessages] = useState([]);
 
   useEffect(() => {
+    setMessages([]);
+  }, [roomId]);
+
+  useEffect(() => {
     if (!roomId || !channel) {
       return;
     }
 
+    let active = true;
     const handleMessage = ({ payload }) => {
-      if (!payload) {
+      if (!active || !payload || payload.room_id !== roomId) {
         return;
       }
 
@@ -37,7 +42,7 @@ export function useChat({ roomId, channel, displayName, userId }) {
     };
 
     const handleNotice = ({ payload }) => {
-      if (!payload?.text) {
+      if (!active || !payload?.text) {
         return;
       }
 
@@ -57,6 +62,7 @@ export function useChat({ roomId, channel, displayName, userId }) {
     channel.on('broadcast', { event: 'chat:notice' }, handleNotice);
 
     return () => {
+      active = false;
       if (typeof channel.off === 'function') {
         channel.off('broadcast', { event: 'chat:message' }, handleMessage);
         channel.off('broadcast', { event: 'chat:notice' }, handleNotice);
@@ -69,6 +75,7 @@ export function useChat({ roomId, channel, displayName, userId }) {
       return;
     }
 
+    let active = true;
     const loadHistory = async () => {
       const { data, error } = await supabase
         .from('messages')
@@ -78,13 +85,22 @@ export function useChat({ roomId, channel, displayName, userId }) {
         .limit(100);
 
       if (error) {
+        console.error('Unable to load room chat history.', error);
         return;
       }
 
-      setMessages((data || []).map(toListMessage).slice(-100));
+      if (!active) return;
+      const history = (data || []).map(toListMessage);
+      setMessages((current) => {
+        const byId = new Map(history.map((message) => [message.id, message]));
+        current.forEach((message) => byId.set(message.id, message));
+        return [...byId.values()].slice(-100);
+      });
     };
 
-    loadHistory();
+    void loadHistory().catch((error) => {
+      if (active) console.error('Unable to load room chat history.', error);
+    });
 
     const subscription = supabase
       .channel(`messages:${roomId}`)
@@ -104,11 +120,14 @@ export function useChat({ roomId, channel, displayName, userId }) {
       .subscribe();
 
     return () => {
-      subscription.unsubscribe();
+      active = false;
+      void supabase.removeChannel(subscription).catch((error) => {
+        console.error('Unable to remove the room chat channel.', error);
+      });
     };
   }, [roomId]);
 
-  const addSystemMessage = (text) => {
+  const addSystemMessage = useCallback((text) => {
     if (!text?.trim()) {
       return;
     }
@@ -124,7 +143,7 @@ export function useChat({ roomId, channel, displayName, userId }) {
     };
 
     setMessages((current) => [...current, systemMessage].slice(-100));
-  };
+  }, [roomId]);
 
   const sendMessage = async (rawMessage) => {
     const messageText = String(rawMessage || '').trim();
@@ -156,21 +175,24 @@ export function useChat({ roomId, channel, displayName, userId }) {
       ].slice(-100));
     };
 
-    if (supabase) {
-      try {
-        const { error } = await supabase.from('messages').insert([
-          {
-            room_id: roomId,
-            name: displayName || 'Guest',
-            text: cleanedText,
-          },
-        ]);
-        if (error) {
-          showLocalFallback();
-        }
-      } catch (error) {
+    if (!supabase) {
+      showLocalFallback();
+      return;
+    }
+
+    try {
+      const { error } = await supabase.from('messages').insert([
+        {
+          room_id: roomId,
+          name: displayName || 'Guest',
+          text: cleanedText,
+        },
+      ]);
+      if (error) {
         showLocalFallback();
       }
+    } catch (error) {
+      showLocalFallback();
     }
   };
 

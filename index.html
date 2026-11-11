@@ -3,8 +3,27 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <meta name="description" content="Rave watch party app" />
-    <title>Rave</title>
+    <meta name="description" content="Nook — watch videos together in sync, with chat and voice." />
+    <meta name="color-scheme" content="light dark" />
+    <meta name="theme-color" content="#fafafa" media="(prefers-color-scheme: light)" />
+    <meta name="theme-color" content="#09090b" media="(prefers-color-scheme: dark)" />
+    <title>Nook — Watch together, in sync</title>
+    <script>
+      (function () {
+        try {
+          var stored = localStorage.getItem('nook-theme');
+          var isDark = stored
+            ? stored === 'dark'
+            : window.matchMedia('(prefers-color-scheme: dark)').matches;
+          if (isDark) document.documentElement.classList.add('dark');
+          document.documentElement.style.colorScheme = isDark ? 'dark' : 'light';
+        } catch (error) {
+          // Theme persistence is optional; the default light theme still renders.
+        }
+      })();
+    </script>
+    <script src="https://accounts.google.com/gsi/client" async defer></script>
+    <script src="https://apis.google.com/js/api.js" async defer></script>
   </head>
   <body>
     <div id="root"></div>

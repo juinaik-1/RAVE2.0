@@ -1,489 +1,214 @@
 import express from 'express';
 import cors from 'cors';
-import dotenv from 'dotenv';
+import helmet from 'helmet';
 import rateLimit from 'express-rate-limit';
-import fs from 'node:fs';
-import path from 'node:path';
-import { fileURLToPath } from 'node:url';
-import crypto from 'node:crypto';
-import { execFile } from 'node:child_process';
-import { ensureFreeDiskSpace, isValidJobId, isValidMp4Name, resolveTargetAndBlockPrivateHosts, validateApiKey } from './security.js';
+import { config, ensureDataDirectories } from './config.js';
+import { authenticateGoogleIdToken, issueSessionToken, requireSession } from './auth.js';
+import {
+  completeDriveAuthorization,
+  createDriveAuthorization,
+  disconnectDrive,
+  getDriveAccessToken,
+  isDriveConnected,
+} from './driveOAuth.js';
+import {
+  cancelJob,
+  cleanupExpiredJobs,
+  createJob,
+  getJob,
+  requestJobConversion,
+} from './jobs.js';
+import {
+  deleteExpiredStreams,
+  deleteStream,
+  getStream,
+  getStreamAccess,
+  registerDriveStream,
+  serveStream,
+} from './streams.js';
+import { isValidJobId, isValidStreamId } from './security.js';
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-
-for (const envPath of [path.resolve(__dirname, '.env'), path.resolve(process.cwd(), '.env')]) {
-  if (fs.existsSync(envPath)) {
-    dotenv.config({ path: envPath });
-  }
-}
+ensureDataDirectories();
 
 const app = express();
-const port = Number(process.env.PORT || 3001);
-const apiKey = process.env.API_KEY || 'dev-api-key';
-const allowedOrigins = (process.env.ALLOWED_ORIGIN || 'http://localhost:5173,http://localhost:5175,http://localhost:4173').split(',').map((origin) => origin.trim()).filter(Boolean);
-const publicBaseUrl = process.env.PUBLIC_BASE_URL || `http://localhost:${port}`;
-const downloadDir = path.resolve(__dirname, process.env.DOWNLOAD_DIR || './downloads');
-const maxQueueSize = Number(process.env.MAX_QUEUE_SIZE || 3);
-const maxSourceGb = Number(process.env.MAX_SOURCE_GB || 5);
-const fileTtlHours = Number(process.env.FILE_TTL_HOURS || 24);
+app.set('trust proxy', 1);
+app.disable('x-powered-by');
+app.use(helmet({ crossOriginResourcePolicy: { policy: 'cross-origin' } }));
+app.use(cors({
+  origin(origin, callback) {
+    callback(null, Boolean(origin && config.frontendOrigins.includes(origin)));
+  },
+  methods: ['GET', 'HEAD', 'POST', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Authorization', 'Content-Type', 'Range'],
+  exposedHeaders: ['Accept-Ranges', 'Content-Range', 'Content-Length'],
+  credentials: false,
+  maxAge: 600,
+}));
+app.use(express.json({ limit: '128kb' }));
 
-const jobs = new Map();
-
-app.use(express.json({ limit: '10mb' }));
-
-app.use(
-  cors({
-    origin: (requestOrigin, callback) => {
-      if (!requestOrigin) {
-        return callback(null, true);
-      }
-
-      const isAllowed =
-        allowedOrigins.includes(requestOrigin) ||
-        requestOrigin.endsWith('.vercel.app') ||
-        requestOrigin.startsWith('http://localhost') ||
-        requestOrigin.startsWith('https://localhost') ||
-        requestOrigin.startsWith('http://127.0.0.1') ||
-        requestOrigin.startsWith('https://127.0.0.1');
-
-      if (isAllowed) {
-        callback(null, true);
-        return;
-      }
-
-      callback(new Error('Not allowed by CORS'));
-    },
-    credentials: true,
-  }),
-);
-
+const authLimiter = rateLimit({
+  windowMs: 60_000, limit: 10, standardHeaders: 'draft-7', legacyHeaders: false,
+  message: { error: 'Too many authentication attempts. Try again shortly.' },
+});
+const driveLimiter = rateLimit({
+  windowMs: 60_000, limit: 30, standardHeaders: 'draft-7', legacyHeaders: false,
+  message: { error: 'Too many Google Drive requests. Try again shortly.' },
+});
+const jobsLimiter = rateLimit({
+  windowMs: 60_000, limit: 20, standardHeaders: 'draft-7', legacyHeaders: false,
+  message: { error: 'Too many conversion requests. Try again shortly.' },
+});
 const apiLimiter = rateLimit({
-  windowMs: 60_000,
-  max: 120,
-  standardHeaders: true,
-  legacyHeaders: false,
-  message: {
-    error: 'Too many conversion requests. Please wait a moment and try again.',
-  },
-  skip: (req) => {
-    const path = (req.path || '').toLowerCase();
-    return path.startsWith('/download') || path.startsWith('/health');
-  },
+  windowMs: 60_000, limit: 120, standardHeaders: 'draft-7', legacyHeaders: false,
+  message: { error: 'Too many API requests. Try again shortly.' },
 });
 
-app.use('/api/', apiLimiter);
+app.use('/api/auth', authLimiter);
+app.use('/api/drive', driveLimiter);
+app.use('/api', apiLimiter);
+app.use('/api', (req, res, next) => {
+  const isPublic = req.path === '/health'
+    || (req.path === '/auth/google' && req.method === 'POST')
+    || (req.path === '/auth/google/callback' && req.method === 'GET')
+    || (/^\/streams\/[a-f0-9]{32}\/access$/.test(req.path) && req.method === 'POST')
+    || (req.path.startsWith('/stream/') && ['GET', 'HEAD'].includes(req.method));
+  return isPublic ? next() : requireSession(req, res, next);
+});
 
-function ensureDownloadDir() {
-  fs.mkdirSync(downloadDir, { recursive: true });
-}
+app.get('/api/health', (_req, res) => res.json({ ok: true, status: 'healthy' }));
 
-function normalizeSourceUrl(url) {
-  if (!url || typeof url !== 'string') {
-    return url;
-  }
-
-  const trimmed = url.trim();
-  if (!trimmed) {
-    return trimmed;
-  }
-
+app.post('/api/auth/google', async (req, res, next) => {
   try {
-    const parsed = new URL(trimmed);
-    const host = parsed.hostname.toLowerCase();
-
-    if (host.includes('drive.google.com')) {
-      const fileId = parsed.searchParams.get('id') || trimmed.match(/(?:\/d\/|id=)([a-zA-Z0-9_-]+)/i)?.[1];
-      if (fileId) {
-        const directUrl = new URL('https://drive.google.com/uc');
-        directUrl.searchParams.set('export', 'download');
-        directUrl.searchParams.set('id', fileId);
-
-        const resourceKey = parsed.searchParams.get('resourcekey');
-        if (resourceKey) {
-          directUrl.searchParams.set('resourcekey', resourceKey);
-        }
-
-        return directUrl.toString();
-      }
-    }
-  } catch (_error) {
-    // fall back to original string if URL parsing fails
-  }
-
-  return trimmed;
-}
-
-function sanitizeSourceUrl(url) {
-  if (!url || typeof url !== 'string') {
-    throw new Error('A source URL is required.');
-  }
-
-  const normalized = normalizeSourceUrl(url);
-  if (normalized.length > 2048) {
-    throw new Error('Source URL is too long.');
-  }
-
-  return normalized;
-}
-
-async function detectDirectMediaUrl(url) {
-  if (!url || typeof url !== 'string') {
-    return false;
-  }
-
-  const safeUrl = sanitizeSourceUrl(url);
-  const lowered = safeUrl.toLowerCase();
-  const filenameMatches = /\.(mp4|webm|ogg|m4v|mov|m3u8|m4a)([?#].*)?$/i.test(safeUrl);
-
-  if (filenameMatches || /(?:video\/|mime=video|\.mp4(?:\?|$)|\.webm(?:\?|$)|\.ogg(?:\?|$)|\.mov(?:\?|$)|\.m4v(?:\?|$))/i.test(lowered)) {
-    return true;
-  }
-
-  const headersToCheck = [];
-
-  try {
-    const headResponse = await fetch(safeUrl, {
-      method: 'HEAD',
-      redirect: 'follow',
+    const user = await authenticateGoogleIdToken(req.body?.credential);
+    return res.json({
+      token: issueSessionToken(user),
+      user: { id: user.id, email: user.email, name: user.name, picture: user.picture },
     });
-    const headType = (headResponse.headers.get('content-type') || '').toLowerCase();
-    const contentDisposition = (headResponse.headers.get('content-disposition') || '').toLowerCase();
-    headersToCheck.push(headType, contentDisposition);
-    if (headType.startsWith('video/') || /\.(mp4|webm|ogg|mov|m4v|m3u8)/i.test(contentDisposition)) {
-      return true;
-    }
-  } catch (_error) {
-    // fall through to a GET probe if HEAD is rejected
-  }
-
-  try {
-    const getResponse = await fetch(safeUrl, {
-      method: 'GET',
-      redirect: 'follow',
-    });
-    const contentType = (getResponse.headers.get('content-type') || '').toLowerCase();
-    const contentDisposition = (getResponse.headers.get('content-disposition') || '').toLowerCase();
-    headersToCheck.push(contentType, contentDisposition);
-    if (contentType.startsWith('video/') || /\.(mp4|webm|ogg|mov|m4v|m3u8)/i.test(contentDisposition)) {
-      return true;
-    }
-  } catch (_error) {
-    // ignore probe errors and fall back to false
-  }
-
-  return false;
-}
-
-function createJobId() {
-  return crypto.randomBytes(8).toString('hex');
-}
-
-function getFileSizeInBytes(filePath) {
-  try {
-    const stats = fs.statSync(filePath);
-    return stats.size;
-  } catch (_error) {
-    return 0;
-  }
-}
-
-function cleanupExpiredJobs() {
-  const now = Date.now();
-  for (const [jobId, job] of jobs.entries()) {
-    const ttlMs = job.ttlMs || fileTtlHours * 60 * 60 * 1000;
-    if (job.completedAt && now - job.completedAt > ttlMs) {
-      try {
-        if (job.outputPath && fs.existsSync(job.outputPath)) {
-          fs.unlinkSync(job.outputPath);
-        }
-      } catch (_error) {
-        // ignore cleanup errors
-      }
-      jobs.delete(jobId);
-    }
-  }
-}
-
-function serializeJob(job) {
-  return {
-    id: job.id,
-    status: job.status,
-    sourceUrl: job.sourceUrl,
-    message: job.message,
-    progress: Number(job.progress || 0),
-    outputUrl: job.outputUrl || job.url || '',
-    url: job.outputUrl || job.url || '',
-    fileSize: Number(job.fileSize || 0),
-    error: job.error || '',
-    audioTracks: job.audioTracks || [],
-    createdAt: job.createdAt,
-    completedAt: job.completedAt,
-  };
-}
-
-function ensureQueueCapacity() {
-  if (jobs.size >= maxQueueSize) {
-    const error = new Error('Queue is full. Try again soon.');
-    error.statusCode = 429;
-    throw error;
-  }
-}
-
-async function triggerConversion(jobId, sourceUrl, options = {}) {
-  const job = jobs.get(jobId);
-  if (!job) {
-    return;
-  }
-
-  const maxHeight = options.maxHeight || 'original';
-  const audioTrack = Number.isFinite(Number(options.audioTrack)) ? Number(options.audioTrack) : undefined;
-
-  try {
-    const safeUrl = sanitizeSourceUrl(sourceUrl);
-    const isDirectMedia = await detectDirectMediaUrl(safeUrl);
-
-    if (isDirectMedia) {
-      job.status = 'done';
-      job.progress = 100;
-      job.message = 'Direct media URL accepted';
-      job.outputUrl = safeUrl;
-      job.url = safeUrl;
-      job.fileSize = 0;
-      job.completedAt = Date.now();
-      return;
-    }
-
-    job.status = 'downloading';
-    job.message = 'Resolving source and validating access';
-    job.progress = 10;
-
-    await resolveTargetAndBlockPrivateHosts(safeUrl);
-    ensureFreeDiskSpace(maxSourceGb * 1024 * 1024 * 1024);
-
-    const outputFile = path.join(downloadDir, `${jobId}.mp4`);
-    const args = [
-      '--no-warnings',
-      '--restrict-filenames',
-      '--output', outputFile,
-      '--merge-output-format', 'mp4',
-      '--retries', '2',
-      '--fragment-retries', '2',
-      '--no-check-certificates',
-    ];
-
-    if (maxHeight && maxHeight !== 'original') {
-      args.push('--format', `bestvideo[height<=${maxHeight}]+bestaudio/best[height<=${maxHeight}]/best`);
-    }
-
-    if (audioTrack !== undefined && Number.isFinite(audioTrack)) {
-      args.push('--extract-audio', '--audio-format', 'mp3');
-    }
-
-    args.push(safeUrl);
-
-    job.status = 'converting';
-    job.message = 'Downloading and converting video';
-    job.progress = 35;
-
-    await new Promise((resolve, reject) => {
-      execFile('yt-dlp', args, { timeout: 1000 * 60 * 15 }, (error, stdout, stderr) => {
-        if (error) {
-          reject(new Error(stderr || stdout || error.message));
-          return;
-        }
-        resolve({ stdout, stderr });
-      });
-    });
-
-    if (!fs.existsSync(outputFile)) {
-      throw new Error('The conversion did not produce a media file.');
-    }
-
-    const finalSize = getFileSizeInBytes(outputFile);
-    if (finalSize <= 0) {
-      throw new Error('The converted file was empty.');
-    }
-
-    job.status = 'done';
-    job.progress = 100;
-    job.message = 'Conversion complete';
-    job.outputPath = outputFile;
-    job.outputUrl = `${publicBaseUrl}/api/download/${jobId}.mp4`;
-    job.url = job.outputUrl;
-    job.fileSize = finalSize;
-    job.completedAt = Date.now();
   } catch (error) {
-    job.status = 'failed';
-    job.progress = 100;
-    job.message = error.message || 'Conversion failed';
-    job.error = error.message || 'Unknown conversion error';
-    job.completedAt = Date.now();
+    if (!error.status) error.status = 401;
+    return next(error);
   }
-}
+});
 
-function createJobFromRequest(req, res) {
-  const apiKeyHeader = req.headers['x-api-key'];
-  if (!validateApiKey(String(apiKeyHeader || ''), apiKey)) {
-    return res.status(401).json({ error: 'Invalid API key.' });
-  }
-
+app.get('/api/auth/google/callback', async (req, res) => {
+  const frontend = config.frontendOrigins[0];
+  if (req.query.error) return res.redirect(`${frontend}/?drive=cancelled`);
   try {
-    ensureQueueCapacity();
+    const user = await completeDriveAuthorization(req.query.state, req.query.code);
+    const target = new URL(user.returnTo, frontend);
+    target.searchParams.set('drive', 'connected');
+    target.searchParams.set('account', user.email);
+    return res.redirect(target.toString());
+  } catch {
+    const target = new URL('/', frontend);
+    target.searchParams.set('drive', 'error');
+    return res.redirect(target.toString());
+  }
+});
+
+app.get('/api/auth/me', (req, res) => res.json({ user: req.user }));
+app.post('/api/drive/connect', (req, res, next) => {
+  try {
+    return res.json({ authUrl: createDriveAuthorization(req.user, req.body?.returnTo || '/') });
   } catch (error) {
-    return res.status(error.statusCode || 500).json({ error: error.message });
+    return next(error);
   }
-
-  const rawSourceUrl = req.body?.url;
-  if (!rawSourceUrl || typeof rawSourceUrl !== 'string') {
-    return res.status(400).json({ error: 'url is required.' });
+});
+app.get('/api/drive/picker-token', async (req, res, next) => {
+  try {
+    if (!isDriveConnected(req.user.id)) {
+      return res.status(409).json({ error: 'Connect Google Drive before opening the picker.' });
+    }
+    return res.json({ accessToken: await getDriveAccessToken(req.user.id) });
+  } catch (error) {
+    return next(error);
   }
+});
+app.post('/api/drive/disconnect', async (req, res, next) => {
+  try {
+    await disconnectDrive(req.user.id);
+    return res.json({ disconnected: true });
+  } catch (error) {
+    return next(error);
+  }
+});
 
-  const sourceUrl = normalizeSourceUrl(rawSourceUrl);
-  const maxHeight = req.body?.maxHeight || 'original';
-  const audioTrack = req.body?.audioTrack;
-  const jobId = createJobId();
+app.post('/api/streams', async (req, res, next) => {
+  try {
+    const result = await registerDriveStream(req.user.id, req.body?.fileId);
+    return res.status(201).json({
+      streamId: result.streamId,
+      name: result.name,
+      playable: result.playable,
+      reason: result.reason,
+      audioTracks: result.audioTracks,
+    });
+  } catch (error) {
+    return next(error);
+  }
+});
+app.post('/api/streams/:streamId/access', (req, res) => {
+  if (!isValidStreamId(req.params.streamId)) return res.status(400).json({ error: 'Invalid stream ID.' });
+  const result = getStreamAccess(req.params.streamId);
+  return result ? res.json(result) : res.status(404).json({ error: 'Stream not found or expired.' });
+});
+app.delete('/api/streams/:streamId', (req, res) => {
+  if (!isValidStreamId(req.params.streamId)) return res.status(400).json({ error: 'Invalid stream ID.' });
+  const record = getStream(req.params.streamId);
+  if (!record) return res.status(404).json({ error: 'Stream not found.' });
+  if (record.ownerUserId !== req.user.id) return res.status(403).json({ error: 'Only the stream owner can delete it.' });
+  deleteStream(record.streamId);
+  return res.json({ deleted: true });
+});
+app.get('/api/stream/:streamId', serveStream);
+app.head('/api/stream/:streamId', serveStream);
 
-  const job = {
-    id: jobId,
-    status: 'queued',
-    createdAt: Date.now(),
-    ttlMs: fileTtlHours * 60 * 60 * 1000,
-    sourceUrl,
-    message: 'Queued for conversion',
-    progress: 0,
-    outputPath: null,
-    outputUrl: '',
-    url: '',
-    fileSize: 0,
-    error: '',
-    audioTracks: [],
-    options: {
-      maxHeight,
-      audioTrack,
-    },
-  };
-
-  jobs.set(jobId, job);
-  setImmediate(() => triggerConversion(jobId, sourceUrl, job.options));
-
-  return res.status(202).json({
-    id: jobId,
-    jobId,
-    status: 'queued',
-    url: `/api/jobs/${jobId}`,
-  });
-}
-
-app.post('/api/jobs', createJobFromRequest);
-app.post('/api/convert', createJobFromRequest);
-
+app.post('/api/jobs', jobsLimiter, async (req, res, next) => {
+  try {
+    return res.status(202).json(await createJob(req.user.id, {
+      streamId: req.body?.streamId,
+      url: req.body?.url,
+    }));
+  } catch (error) {
+    return next(error);
+  }
+});
 app.get('/api/jobs/:jobId', (req, res) => {
-  const apiKeyHeader = req.headers['x-api-key'];
-  if (!validateApiKey(String(apiKeyHeader || ''), apiKey)) {
-    return res.status(401).json({ error: 'Invalid API key.' });
-  }
-
-  const jobId = req.params.jobId;
-  if (!isValidJobId(jobId)) {
-    return res.status(400).json({ error: 'Invalid job ID.' });
-  }
-
-  const job = jobs.get(jobId);
-  if (!job) {
-    return res.status(404).json({ error: 'Job not found.' });
-  }
-
-  return res.json(serializeJob(job));
+  if (!isValidJobId(req.params.jobId)) return res.status(400).json({ error: 'Invalid job ID.' });
+  const job = getJob(req.params.jobId, req.user.id);
+  return job ? res.json(job) : res.status(404).json({ error: 'Job not found.' });
 });
-
+app.post('/api/jobs/:jobId/convert', jobsLimiter, (req, res, next) => {
+  if (!isValidJobId(req.params.jobId)) return res.status(400).json({ error: 'Invalid job ID.' });
+  try {
+    return res.status(202).json(requestJobConversion(req.params.jobId, req.user.id, req.body));
+  } catch (error) {
+    return next(error);
+  }
+});
 app.delete('/api/jobs/:jobId', (req, res) => {
-  const apiKeyHeader = req.headers['x-api-key'];
-  if (!validateApiKey(String(apiKeyHeader || ''), apiKey)) {
-    return res.status(401).json({ error: 'Invalid API key.' });
-  }
-
-  const jobId = req.params.jobId;
-  if (!isValidJobId(jobId)) {
-    return res.status(400).json({ error: 'Invalid job ID.' });
-  }
-
-  const job = jobs.get(jobId);
-  if (!job) {
-    return res.status(404).json({ error: 'Job not found.' });
-  }
-
-  if (job.outputPath && fs.existsSync(job.outputPath)) {
-    fs.unlinkSync(job.outputPath);
-  }
-
-  job.status = 'cancelled';
-  job.message = 'Conversion cancelled';
-  job.progress = 100;
-  job.error = '';
-  jobs.set(jobId, job);
-
-  return res.json(serializeJob(job));
+  if (!isValidJobId(req.params.jobId)) return res.status(400).json({ error: 'Invalid job ID.' });
+  const job = cancelJob(req.params.jobId, req.user.id);
+  return job ? res.json(job) : res.status(404).json({ error: 'Job not found.' });
 });
 
-app.get('/api/download/:fileName', (req, res) => {
-  const fileName = req.params.fileName;
-  if (!isValidMp4Name(fileName)) {
-    return res.status(400).json({ error: 'Invalid file name.' });
-  }
-
-  const filePath = path.join(downloadDir, fileName);
-  if (!filePath.startsWith(downloadDir)) {
-    return res.status(400).json({ error: 'Invalid file location.' });
-  }
-
-  if (!fs.existsSync(filePath)) {
-    return res.status(404).json({ error: 'File not found.' });
-  }
-
-  const lowerName = fileName.toLowerCase();
-  const contentType = lowerName.endsWith('.webm')
-    ? 'video/webm'
-    : lowerName.endsWith('.ogg')
-      ? 'video/ogg'
-      : lowerName.endsWith('.mov') || lowerName.endsWith('.m4v')
-        ? 'video/quicktime'
-        : 'video/mp4';
-
-  return res.sendFile(filePath, {
-    headers: {
-      'Content-Type': contentType,
-      'Content-Disposition': 'inline; filename="converted-video.mp4"',
-    },
+app.use((error, _req, res, _next) => {
+  const status = Number(error.status || error.statusCode || 500);
+  return res.status(status).json({
+    error: status >= 500 ? 'The request could not be completed.' : error.message,
   });
 });
 
-app.get('/api/health', (_req, res) => {
-  res.json({ ok: true, status: 'healthy', jobs: jobs.size });
-});
-
-app.use((_req, res) => {
-  res.status(404).json({ error: 'Not found.' });
-});
-
-ensureDownloadDir();
+const cleanupTimer = setInterval(() => {
+  try {
+    cleanupExpiredJobs();
+    deleteExpiredStreams();
+  } catch {
+    console.error('Scheduled expired-file cleanup failed.');
+  }
+}, 10 * 60_000);
+cleanupTimer.unref?.();
 cleanupExpiredJobs();
+deleteExpiredStreams();
 
-function startServer(portToTry) {
-  const server = app.listen(portToTry, () => {
-    console.log(`Rave conversion server listening on http://localhost:${portToTry}`);
-  });
-
-  server.on('error', (error) => {
-    if (error.code === 'EADDRINUSE') {
-      const nextPort = portToTry + 1;
-      console.warn(`Port ${portToTry} is already in use. Retrying on ${nextPort}.`);
-      startServer(nextPort);
-      return;
-    }
-
-    throw error;
-  });
-}
-
-startServer(port);
+app.listen(config.port, () => console.log(`Nook API listening on port ${config.port}`));

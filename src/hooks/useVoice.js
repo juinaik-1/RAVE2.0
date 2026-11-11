@@ -83,7 +83,7 @@ export function useVoice({ roomId, channel, userId, displayName, presenceUsers, 
     return () => {
       leaveVoice();
     };
-  }, []);
+  }, [roomId]);
 
   useEffect(() => {
     if (!isJoined || !peerRef.current || !localStreamRef.current || !presenceUsers.length) {

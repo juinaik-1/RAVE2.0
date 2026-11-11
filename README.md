@@ -1,218 +1,130 @@
-# Rave Watch Party
+# Nook Watch Party
 
-A React + Vite watch-party app with synchronized video playback, real-time chat, presence, and mesh voice chat for small rooms.
-
-## Features
-
-- Create or join a room by code
-- Share a room link with friends
-- Synced video playback across the room
-- Host-only playback and video controls toggle
-- Real-time text chat with persistent message history
-- Presence list and join/leave notices
-- Voice chat over PeerJS (mesh topology) with Google STUN and optional TURN
-- Dark theme design for desktop and mobile
-- Static deployment on Vercel, Netlify, or Cloudflare Pages
+Nook is a React/Vite watch-party app with Supabase rooms, synchronized playback, chat, voice, Google sign-in, private Drive streaming, and an authorized video-conversion queue.
 
 ## Local setup
 
-1. Install dependencies:
+1. Install frontend packages: `npm install`.
+2. Copy `.env.example` to `.env` and set the Supabase, Google frontend, and optional TURN values.
+3. Install backend packages: `npm install --prefix server`.
+4. Copy `server/.env.example` to `server/.env`. Configure Google OAuth, the allowlist, and three independently generated secrets as described below.
+5. Install `ffmpeg`, `ffprobe`, and `yt-dlp` on the backend host and make sure they are on `PATH`.
+6. Start both apps with `npm run dev`. The Vite app runs at `http://localhost:5173`, and the API runs at `http://localhost:3001`.
 
-   ```bash
-   npm install
-   ```
+The backend refuses to start when required secrets or configuration are missing or weak. `FRONTEND_ORIGINS` is an exact comma-separated origin list; no wildcard or Vercel-domain rule is used. `.env`, `server/.env`, `DATA_DIR`, and `DOWNLOAD_DIR` must not be committed.
 
-2. Create an environment file:
+## Environment
 
-   ```bash
-   cp .env.example .env
-   ```
-
-3. Add your Supabase values to `.env` and optional TURN values.
-
-4. Start the app:
-
-   ```bash
-   npm run dev
-   ```
-
-5. Open the local Vite URL in the browser (typically `http://localhost:5173`).
-
-## Required environment variables
+Frontend values go in the repository `.env`:
 
 ```env
+VITE_API_URL=http://localhost:3001
+VITE_GOOGLE_CLIENT_ID=your-oauth-client-id.apps.googleusercontent.com
+VITE_GOOGLE_API_KEY=your-restricted-picker-api-key
+VITE_GOOGLE_APP_ID=your-google-cloud-project-number
 VITE_SUPABASE_URL=https://your-project.supabase.co
-VITE_SUPABASE_ANON_KEY=your-anon-key
+VITE_SUPABASE_ANON_KEY=your-supabase-anon-key
 VITE_TURN_URL=turn:relay.metered.ca:80
 VITE_TURN_USERNAME=your-turn-username
 VITE_TURN_CREDENTIAL=your-turn-credential
-VITE_CONVERT_API_URL=https://your-oracle-backend.example.com
-VITE_CONVERT_API_KEY=your-backend-api-key
 ```
 
-The TURN variables are optional. Google STUN is included automatically.
+Server values go in `server/.env`; see [server/.env.example](./server/.env.example). Set `PUBLIC_BASE_URL` to the public API origin in production. It is the origin used to construct signed stream URLs, not a localhost URL. Set `FRONTEND_ORIGINS` to the exact production frontend origin(s). `DATA_DIR` holds encrypted refresh tokens and stream records. `DOWNLOAD_DIR` holds conversion input/output files.
 
-## Supabase setup
+`MAX_SOURCE_GB` limits URL and Drive conversion downloads. `MAX_QUEUE_SIZE` counts only queued and active jobs; one conversion runs at a time. Drive streams expire after 12 hours. Converted-file streams expire after `FILE_TTL_HOURS`. The cleanup task runs every ten minutes.
 
-### 1) Create a free project
+The Convert page accepts a video picked from My Drive or a URL supported by `yt-dlp`. Drive files are identified by their actual media contents, not only their filename or MIME type, so formats such as MKV and AVI can be analyzed and converted when ffmpeg supports their codecs. Google-native documents and folders are not media inputs.
 
-1. Go to https://supabase.com and sign in.
-2. Click "New project".
-3. Pick a project name and database password.
-4. Choose a region close to your users.
-5. Wait for the project to finish provisioning.
+Generate three independent values (run the command once per variable; do not reuse them):
 
-### 2) Get the project URL and anon key
-
-1. Open the Supabase dashboard.
-2. Go to Project Settings > API.
-3. Copy the Project URL and the anon public key.
-4. Put them into `.env` as `VITE_SUPABASE_URL` and `VITE_SUPABASE_ANON_KEY`.
-
-### 3) Create the messages table
-
-Run this in the Supabase SQL editor:
-
-```sql
-create table public.messages (
-  id uuid primary key default gen_random_uuid(),
-  room_id text not null,
-  name text not null default 'Guest',
-  text text not null,
-  created_at timestamptz not null default now()
-);
-
-create index if not exists messages_room_created_at_idx
-  on public.messages (room_id, created_at);
+```powershell
+node -e "console.log(require('node:crypto').randomBytes(32).toString('base64url'))"
 ```
 
-If `gen_random_uuid()` is not available in your project, use:
+Use the first two outputs for `SESSION_SECRET` and `STREAM_SECRET`. For `TOKEN_ENCRYPTION_KEY`, use a fresh 32-byte output encoded as base64:
 
-```sql
-create extension if not exists pgcrypto;
+```powershell
+node -e "console.log(require('node:crypto').randomBytes(32).toString('base64'))"
 ```
 
-### 4) Enable Realtime for the table
+Never put server secrets in Vercel or any `VITE_*` variable. The browser receives a 12-hour application JWT and short-lived stream URLs only; Google refresh tokens stay encrypted in `DATA_DIR`.
 
-1. In Supabase, open the Realtime section.
-2. Enable Realtime for the `messages` table.
-3. Also enable `Presence` and `Broadcast` for the room channel patterns used by the app.
+## Google Cloud configuration
 
-### 5) Add RLS policies
+1. **Create/select a Cloud project.** Enable **Google Drive API** and **Google Picker API** in APIs & Services → Library.
+2. **Configure OAuth consent and branding.** In Google Auth Platform → Branding, set the app name, logo, support email, authorized domain, homepage, and Privacy policy URL to `https://YOUR-FRONTEND-DOMAIN/privacy`. Nook provides the policy at `/privacy`; deploy it on your verified HTTPS domain before entering the URL. Google owns the consent-screen layout and disclosures; Nook cannot replace or restyle Google's account/permission screen. In Audience, choose the intended audience; while in Testing, add each allowed Google account as a test user. In Data Access, add the `https://www.googleapis.com/auth/drive.readonly` scope. This read-only scope lets Nook retrieve Drive files you pick; it cannot edit or delete them. Google classifies it as restricted. Public production apps may need Google verification and a security assessment before users outside the test-user list can authorize it.
+3. **Create a Web application OAuth client.** Under Authorized JavaScript origins, add each exact browser origin, such as `http://localhost:5173` and `https://your-Nook-domain.example`. Under Authorized redirect URIs, add the API callback, such as `http://localhost:3001/api/auth/google/callback` and `https://api.your-Nook-domain.example/api/auth/google/callback`. Put its client ID in both `GOOGLE_CLIENT_ID` and `VITE_GOOGLE_CLIENT_ID`; keep the client secret only in `server/.env`.
+4. **Create a restricted API key for Picker.** Restrict its application to HTTP referrers and list only the exact frontend origins. Under API restrictions, restrict it to **Google Picker API**. Put this public, referrer-restricted key in `VITE_GOOGLE_API_KEY`.
+5. **Set the Picker App ID.** Copy the Cloud project number (not the project name or OAuth client ID) to `VITE_GOOGLE_APP_ID`. This is required for shared-drive Picker support.
+6. **Configure the allowlist.** Put the exact lowercase email addresses allowed to sign in in server `ALLOWED_EMAILS`, comma-separated. OAuth consent test-user status and the Nook allowlist are both required during Testing.
+7. **Set the server callback.** `GOOGLE_REDIRECT_URI` must exactly match the authorized redirect URI. Drive authorization uses one-time state and PKCE, with the `drive.readonly` scope and offline access. After changing from the previous `drive.file` permission, each user must click **Reconnect Drive** and approve the new read-only permission. Existing refresh tokens do not gain broader access automatically. The Picker shows videos and files owned by the signed-in user in My Drive; it excludes items shared with the user and Shared drives.
 
-```sql
-alter table public.messages enable row level security;
+Google Identity Services signs users in; the server verifies the ID token, verified email, audience, and allowlist before issuing an application session.
 
-create policy "Anonymous can view room messages"
-  on public.messages for select
-  using (true);
+Guests can join an existing room by invite link or room code without signing in. Guest access is limited to watching, chat, and voice; guests cannot create rooms, load or control media, connect Drive, or convert videos. Google sign-out clears the local Nook session; it does not revoke the separate Drive authorization. Users can revoke that authorization in Google Account settings.
 
-create policy "Anonymous can insert room messages"
-  on public.messages for insert
-  with check (true);
-```
+## Backend VM
 
-> Note: Supabase free projects pause after roughly one week of inactivity. Re-activating is automatic when traffic resumes.
-
-## Production deployment
-
-### Vercel
-
-1. Push this project to GitHub.
-2. In Vercel, click "Add Project" and import the repository.
-3. Set the framework as Vite.
-4. Add the environment variables from `.env`:
-   - `VITE_SUPABASE_URL`
-   - `VITE_SUPABASE_ANON_KEY`
-   - `VITE_TURN_URL`
-   - `VITE_TURN_USERNAME`
-   - `VITE_TURN_CREDENTIAL`
-   - `VITE_CONVERT_API_URL`
-   - `VITE_CONVERT_API_KEY`
-5. Deploy.
-
-The app is static and works with the provided `vercel.json` SPA rewrite.
-
-### Netlify
-
-1. Push the project to GitHub.
-2. In Netlify, import the repo.
-3. Set the build command to `npm run build`.
-4. Set the publish directory to `dist`.
-5. Add the same environment variables.
-6. Deploy.
-
-The `public/_redirects` file contains the SPA rewrite for Netlify.
-
-### Cloudflare Pages
-
-1. Push to GitHub.
-2. Connect the repo in Cloudflare Pages.
-3. Use the build command `npm run build`.
-4. Use output directory `dist`.
-5. Add environment variables.
-6. Deploy.
-
-## TURN server setup
-
-The app uses Google STUN by default. If your users are behind restrictive NAT or corporate firewalls, add a TURN server for WebRTC relay.
-
-A simple free option is Metered Open Relay:
-
-1. Sign up at https://www.metered.ca/
-2. Create an Open Relay account.
-3. Copy the TURN URL, username, and credential.
-4. Put them into `.env`:
-   - `VITE_TURN_URL`
-   - `VITE_TURN_USERNAME`
-   - `VITE_TURN_CREDENTIAL`
-
-This is optional, but helps with networking reliability.
-
-## Browser requirements
-
-- HTTPS is required for microphone access in the browser.
-- Vercel, Netlify, and Cloudflare Pages all provide HTTPS automatically in production.
-- For local development, `localhost` is trusted for microphone access.
-
-## Testing checklist
-
-Use two browser tabs or two browser windows to verify the core behavior:
-
-1. Create a room in tab 1 and join with a different name in tab 2.
-2. Paste a YouTube link into the room and confirm both tabs sync to the same playback state.
-3. Send messages in both tabs and verify chat appears for every participant.
-4. Click Join voice in both tabs and confirm the voice streams connect and audio plays.
-5. Change host-only controls and confirm only the host can control playback.
-6. Test leave and rejoin flow for presence and chat notices.
-
-## Troubleshooting
-
-### Voice not connecting
-
-- Make sure the site is served over HTTPS in production.
-- Grant microphone permission in the browser.
-- Try a TURN server in `.env` if your network blocks direct peer connections.
-- Check the browser console for PeerJS or WebRTC errors.
-
-### Google Drive video not playing
-
-- Google Drive links may fail for large files because of Google download restrictions.
-- Prefer YouTube for the most reliable playback.
-- Confirm the URL was converted correctly to the Google Drive download endpoint.
-
-### Supabase paused or not responding
-
-- Free projects may pause after inactivity.
-- Re-open the Supabase dashboard and re-trigger activity.
-- Check that Realtime is enabled and that the `messages` table exists.
-- Confirm the environment variables are correct.
-
-## Build and preview
+Use a maintained Linux VM with enough disk space for both the downloaded source and converted output. Install and keep the media tools updated:
 
 ```bash
-npm run build
-npm run preview
+sudo apt-get update
+sudo apt-get install -y ffmpeg python3-pip pipx
+pipx ensurepath
+pipx install yt-dlp
+pipx upgrade yt-dlp
+ffmpeg -version
+ffprobe -version
+yt-dlp --version
 ```
 
-This generates a static `dist` folder that can be deployed anywhere that supports SPA hosting.
+Run the API as a dedicated service account. Keep `DATA_DIR` and `DOWNLOAD_DIR` on a private, persistent filesystem with adequate free space; grant write access only to that account. Set `NODE_ENV=production`, `PUBLIC_BASE_URL=https://api.your-domain.example`, exact `FRONTEND_ORIGINS`, Google credentials, and strong generated secrets. Restart the service after updating `yt-dlp`, `ffmpeg`, or environment values. Conversion accepts only content you own or may legally share.
+
+### Caddy stream proxy
+
+Point the API domain at the VM. Caddy streams reverse-proxy responses; set a negative `flush_interval` on the stream route to disable response buffering and flush immediately:
+
+```caddyfile
+api.your-domain.example {
+	@videoStream path /api/stream/*
+	handle @videoStream {
+		reverse_proxy 127.0.0.1:3001 {
+			flush_interval -1
+		}
+	}
+
+	handle {
+		reverse_proxy 127.0.0.1:3001
+	}
+}
+```
+
+Do not add a response-buffering layer in front of `/api/stream/*`. Preserve `Range` and `Content-Range` headers for seeking.
+
+## Vercel frontend
+
+Set these project environment variables in Vercel (Production and any exact Preview origins you allow):
+
+- `VITE_API_URL=https://api.your-domain.example`
+- `VITE_GOOGLE_CLIENT_ID=...`
+- `VITE_GOOGLE_API_KEY=...`
+- `VITE_GOOGLE_APP_ID=...`
+- Existing `VITE_SUPABASE_URL`, `VITE_SUPABASE_ANON_KEY`, and optional `VITE_TURN_*` values
+
+Add the deployed Vercel frontend origin to the OAuth client’s JavaScript origins, the Picker key’s HTTP-referrer restrictions, and server `FRONTEND_ORIGINS`. Never use a wildcard `.vercel.app` CORS rule. Rebuild/redeploy the frontend after changing Vite environment variables.
+
+## Supabase
+
+Keep the existing Supabase project URL and anon key in the frontend environment. The app uses Supabase Realtime for room presence, chat, and playback-control broadcasts. Configure the existing `messages` table and its read/write policies for room chat in the Supabase SQL editor; do not put a Supabase service-role key in the browser.
+
+## Validation checklist
+
+- [ ] An allowlisted, verified Google email can sign in; a non-allowlisted email is rejected.
+- [ ] Connect Drive, pick a video, share it, and play it on a second signed-in account in the same room.
+- [ ] Seek in a Drive stream and confirm the media request returns `206 Partial Content`.
+- [ ] Change or expire a signed stream URL and confirm the API returns `401`.
+- [ ] An HEVC/MKV Drive video is reported as unplayable and offers **Convert**.
+- [ ] Convert the video, confirm the output plays in a browser, then share it to a room.
+- [ ] Cancel during download and during ffmpeg conversion; confirm the child process stops and temporary files are removed.
+- [ ] Complete four jobs sequentially and confirm completed jobs do not fill the queue.
+- [ ] Convert a 700 MB source with enough disk space and confirm the result completes.
