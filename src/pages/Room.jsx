@@ -69,9 +69,13 @@ export default function Room() {
   const canControl = !hostOnlyControls || isHost;
 
   useEffect(() => {
+    // The host owns the toggle and updates presence itself. Letting presence
+    // sync write back would clobber an optimistic toggle with a stale value,
+    // so only non-host viewers follow the host's presence payload.
+    if (isHost) return;
     const hostPresence = presenceUsers.find((participant) => participant.userId === hostId);
     if (hostPresence) setHostOnlyControls(Boolean(hostPresence.hostOnlyControls));
-  }, [hostId, presenceUsers]);
+  }, [hostId, presenceUsers, isHost]);
 
   const changeHostOnlyControls = (value) => {
     setHostOnlyControls(value);
@@ -84,6 +88,9 @@ export default function Room() {
     isHost,
     canControl,
     send,
+    hostOnlyControls,
+    hostId,
+    userId,
   });
 
   useEffect(() => {
@@ -241,6 +248,7 @@ export default function Room() {
               streamName={video.streamName}
               playing={video.playing}
               time={video.time}
+              roomTime={video.roomTime}
               duration={video.duration}
               canControl={canControl}
               canConvert={Boolean(user)}
@@ -275,7 +283,7 @@ export default function Room() {
                 <Switch
                   id="host-only-controls"
                   checked={hostOnlyControls}
-                  onChange={(value) => changeHostOnlyControls(value)}
+                  onChange={(event) => changeHostOnlyControls(event.target.checked)}
                   label="Host-only controls"
                 />
               ) : <span className="text-xs text-zinc-500">{hostOnlyControls ? 'Host-only playback controls' : 'Everyone can control playback'}</span>}

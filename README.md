@@ -128,3 +128,7 @@ Keep the existing Supabase project URL and anon key in the frontend environment.
 - [ ] Cancel during download and during ffmpeg conversion; confirm the child process stops and temporary files are removed.
 - [ ] Complete four jobs sequentially and confirm completed jobs do not fill the queue.
 - [ ] Convert a 700 MB source with enough disk space and confirm the result completes.
+
+
+## GitDiagram 
+[![Architecture diagram](https://gitdiagram.com/diagram-badge.svg)](https://gitdiagram.com/juinaik-1/rave2.0?utm_source=readme&utm_medium=badge)

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import ReactPlayer from 'react-player';
-import { Clock, Link2, MonitorPlay, Radio, WandSparkles } from 'lucide-react';
+import { Clock, Link2, MonitorPlay, Radio, VolumeX, WandSparkles } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
 import { Badge, Button, Panel, inputClass } from './ui';
 import { normalizeVideoUrl } from '../utils/videoUrl';
@@ -15,8 +15,17 @@ function formatDuration(value) {
   return hours ? `${hours}:${String(minutes).padStart(2, '0')}:${seconds}` : `${minutes}:${seconds}`;
 }
 
+function formatTimestamp(value) {
+  const total = Number(value);
+  if (!Number.isFinite(total) || total < 0) return '0:00';
+  const seconds = String(Math.floor(total % 60)).padStart(2, '0');
+  const minutes = Math.floor((total / 60) % 60);
+  const hours = Math.floor(total / 3600);
+  return hours ? `${hours}:${String(minutes).padStart(2, '0')}:${seconds}` : `${minutes}:${seconds}`;
+}
+
 export default function VideoPlayer({
-  url, streamId, streamName, playing, time, duration = 0, canControl, canConvert = true,
+  url, streamId, streamName, playing, time, roomTime, duration = 0, canControl, canConvert = true,
   loading, error, syncNonce = 0, onPlayPause, onSeek, onProgress, onDuration, onLoadVideo, onVideoError, onReady,
 }) {
   const navigate = useNavigate();
@@ -24,15 +33,48 @@ export default function VideoPlayer({
   const [inputValue, setInputValue] = useState('');
   const [localError, setLocalError] = useState('');
   const [autoplayBlocked, setAutoplayBlocked] = useState(false);
+  const [activated, setActivated] = useState(false);
+  const [playerMuted, setPlayerMuted] = useState(true);
+  const [mutedForUrl, setMutedForUrl] = useState(url);
+  const playingRef = useRef(false);
+  // True while a seek we performed ourselves is in flight, so the resulting
+  // seek event is recognised as an echo rather than a user scrub.
+  const programmaticSeekRef = useRef(null);
+  const programmaticSeekTimerRef = useRef(0);
   const isStream = Boolean(streamId);
   const isDriveMedia = Boolean(url && /^https:\/\/drive\.google\.com\/uc\?/.test(url));
   const useNativePlayer = isStream || isDriveMedia;
+
+  // Reset the mute state during render so a newly mounted player is created
+  // muted from the very first paint (the embedded player only reads `muted` at
+  // load time).
+  if (mutedForUrl !== url) {
+    setMutedForUrl(url);
+    setPlayerMuted(true);
+  }
+
+  useEffect(() => {
+    const markActivated = () => setActivated(true);
+    window.addEventListener('pointerdown', markActivated);
+    window.addEventListener('keydown', markActivated);
+    return () => {
+      window.removeEventListener('pointerdown', markActivated);
+      window.removeEventListener('keydown', markActivated);
+    };
+  }, []);
+
+  // Restore audio once playback is running and the page has a gesture.
+  useEffect(() => {
+    if (activated && playingRef.current) setPlayerMuted(false);
+  }, [activated]);
 
   useEffect(() => {
     setInputValue('');
     setAutoplayBlocked(false);
     setLocalError('');
-  }, [streamId]);
+    playingRef.current = false;
+    programmaticSeekRef.current = null;
+  }, [streamId, url]);
 
   // ReactPlayer exposes a different object per provider: a DOM <video> for file/direct
   // URLs, a YT.Player for YouTube, and the Vimeo Player SDK instance for Vimeo. The
@@ -68,12 +110,29 @@ export default function VideoPlayer({
       // HTML5 <video>/<audio>
       if (playing && player.paused) {
         const playResult = player.play();
-        if (playResult?.catch) playResult.catch(() => setAutoplayBlocked(true));
+        if (playResult?.catch) {
+          playResult.catch(() => {
+            try { player.muted = true; } catch { /* ignore */ }
+            const mutedResult = player.play();
+            if (mutedResult?.catch) mutedResult.catch(() => setAutoplayBlocked(true));
+          });
+        }
       } else if (!playing && !player.paused) {
         player.pause();
       }
     }
   }, [getPlayer, playing]);
+
+  // The player reports every seek through one event, whether the user dragged
+  // the scrub bar or the sync engine moved it. Record the position we seek to
+  // ourselves so the hook can tell a deliberate seek from an echo.
+  const markProgrammaticSeek = useCallback((target) => {
+    programmaticSeekRef.current = { time: Number(target), at: Date.now() };
+    window.clearTimeout(programmaticSeekTimerRef.current);
+    programmaticSeekTimerRef.current = window.setTimeout(() => {
+      programmaticSeekRef.current = null;
+    }, 3000);
+  }, []);
 
   const syncTime = useCallback(() => {
     if (!Number.isFinite(time)) return;
@@ -82,23 +141,32 @@ export default function VideoPlayer({
     if (typeof player.playVideo === 'function' && typeof player.seekTo === 'function') {
       // YouTube (YT.Player)
       const current = Number(player.getCurrentTime?.());
-      if (!Number.isFinite(current) || Math.abs(current - time) > 1) player.seekTo(time, true);
+      if (!Number.isFinite(current) || Math.abs(current - time) > 1) {
+        markProgrammaticSeek(time);
+        player.seekTo(time, true);
+      }
       return;
     }
     if (typeof player.setCurrentTime === 'function') {
       // Vimeo (Player SDK) — getCurrentTime/setCurrentTime are async
       Promise.resolve(typeof player.getCurrentTime === 'function' ? player.getCurrentTime() : 0)
         .then((current) => {
-          if (Math.abs((Number(current) || 0) - time) > 1) player.setCurrentTime(time);
+          if (Math.abs((Number(current) || 0) - time) > 1) {
+            markProgrammaticSeek(time);
+            player.setCurrentTime(time);
+          }
         })
         .catch(() => {});
       return;
     }
     if (typeof player.currentTime === 'number') {
       // HTML5 <video>/<audio>
-      if (Math.abs((player.currentTime || 0) - time) > 1) player.currentTime = time;
+      if (Math.abs((player.currentTime || 0) - time) > 1) {
+        markProgrammaticSeek(time);
+        player.currentTime = time;
+      }
     }
-  }, [getPlayer, time]);
+  }, [getPlayer, markProgrammaticSeek, time]);
 
   useEffect(() => {
     if (!url) return;
@@ -110,28 +178,55 @@ export default function VideoPlayer({
     syncTime();
   }, [syncTime, url, streamId, syncNonce]);
 
-  // YouTube/Vimeo don't reject play() when the browser blocks autoplay, so probe the
-  // player state shortly after a sync to surface the same "Click to start" fallback.
+  // YouTube/Vimeo don't reject play() when the browser blocks autoplay, and a
+  // native player can resolve without starting, so probe the player state
+  // shortly after a sync to surface the same "Click to start" fallback.
   useEffect(() => {
     if (!url || !playing) return undefined;
     const player = getPlayer();
     const isYouTube = typeof player?.getPlayerState === 'function' && typeof player?.playVideo === 'function';
     const isVimeo = !isYouTube && typeof player?.getPaused === 'function';
-    if (!isYouTube && !isVimeo) return undefined;
+    const isHtml5 = !isYouTube && !isVimeo && typeof player?.play === 'function';
+    if (!isYouTube && !isVimeo && !isHtml5) return undefined;
     const timer = window.setTimeout(() => {
       try {
         if (isYouTube) {
           const state = player.getPlayerState();
           if (state !== 1 && state !== 3) setAutoplayBlocked(true);
-        } else {
+        } else if (isVimeo) {
           Promise.resolve(player.getPaused()).then((paused) => {
             if (paused) setAutoplayBlocked(true);
           }).catch(() => {});
+        } else if (player.paused) {
+          setAutoplayBlocked(true);
         }
       } catch { /* ignore */ }
     }, 1500);
     return () => window.clearTimeout(timer);
   }, [getPlayer, url, playing, syncNonce]);
+
+  const reassertRoomState = useCallback(() => {
+    syncPlayback();
+    syncTime();
+  }, [syncPlayback, syncTime]);
+
+  const reportSeek = useCallback((seconds) => {
+    const value = Number(seconds);
+    if (!Number.isFinite(value)) return;
+    // The seek is an echo when it matches a position the sync engine just
+    // applied. A user scrub to a different position is always authoritative.
+    const pending = programmaticSeekRef.current;
+    const isEcho = Boolean(pending)
+      && Math.abs(value - pending.time) < 1
+      && Date.now() - pending.at < 3000;
+    if (isEcho) {
+      programmaticSeekRef.current = null;
+      window.clearTimeout(programmaticSeekTimerRef.current);
+      onSeek?.(value, { userInitiated: false });
+      return;
+    }
+    onSeek?.(value, { userInitiated: true });
+  }, [onSeek]);
 
   const submit = (event) => {
     event.preventDefault();
@@ -143,12 +238,26 @@ export default function VideoPlayer({
     setLocalError('');
     onLoadVideo?.(normalized);
   };
+  const handleUnmute = useCallback(() => {
+    setActivated(true);
+    setPlayerMuted(false);
+    const player = getPlayer();
+    if (!player) return;
+    try {
+      if (typeof player.unmute === 'function') player.unmute();
+      else if ('muted' in player) player.muted = false;
+    } catch { /* ignore */ }
+  }, [getPlayer]);
+
   const durationLabel = formatDuration(duration);
+  const positionLabel = formatTimestamp(roomTime);
+  const showUnmute = playerMuted && playing && url;
 
   return (
     <div className="flex flex-col gap-3">
       <Panel className="overflow-hidden">
         <div className="relative aspect-video w-full overflow-hidden bg-zinc-950">
+          <div className={cn('absolute inset-0', !canControl && 'pointer-events-none')}>
           {url ? (useNativePlayer ? (
             <>
               <video
@@ -158,6 +267,7 @@ export default function VideoPlayer({
                 controls={canControl}
                 playsInline
                 preload="metadata"
+                muted={playerMuted}
                 className="absolute inset-0 h-full w-full bg-black object-contain"
                 onLoadedMetadata={(event) => {
                   if (time > 0) event.currentTarget.currentTime = time;
@@ -165,12 +275,40 @@ export default function VideoPlayer({
                   syncPlayback();
                   syncTime();
                 }}
-                onPlay={() => { setAutoplayBlocked(false); setLocalError(''); onPlayPause?.(true); }}
-                onPause={() => onPlayPause?.(false)}
+                onPlay={(event) => {
+                  playingRef.current = true;
+                  if (activated) {
+                    event.currentTarget.muted = false;
+                    setPlayerMuted(false);
+                  }
+                  // A viewer without control must follow the host's play state.
+                  if (!canControl && !playing) {
+                    event.currentTarget.pause();
+                    return;
+                  }
+                  setAutoplayBlocked(false);
+                  setLocalError('');
+                  onPlayPause?.(true);
+                }}
+                onPause={() => {
+                  playingRef.current = false;
+                  // A viewer without control stays on the room's play state.
+                  if (!canControl) {
+                    reassertRoomState();
+                    return;
+                  }
+                  onPlayPause?.(false);
+                }}
                 onEnded={() => onPlayPause?.(false)}
                 onTimeUpdate={(event) => onProgress?.(event.currentTarget.currentTime)}
                 onDurationChange={(event) => onDuration?.(event.currentTarget.duration)}
-                onSeeked={(event) => onSeek?.(event.currentTarget.currentTime)}
+                onSeeked={(event) => {
+                  if (!canControl) {
+                    reassertRoomState();
+                    return;
+                  }
+                  reportSeek(event.currentTarget.currentTime);
+                }}
                 onError={(event) => {
                   const message = event.currentTarget.error?.code
                     ? `This video failed to load (media error ${event.currentTarget.error.code}).`
@@ -188,16 +326,44 @@ export default function VideoPlayer({
               playing={playing}
               controls={canControl}
               playsinline
+              muted={playerMuted}
               width="100%"
               height="100%"
               className="absolute inset-0"
               onReady={() => { onReady?.(); syncPlayback(); syncTime(); }}
-              onPlay={() => { setAutoplayBlocked(false); onPlayPause?.(true); }}
-              onPause={() => onPlayPause?.(false)}
+              onPlay={() => {
+                playingRef.current = true;
+                // Restore audio once the page has a user gesture.
+                if (activated) setPlayerMuted(false);
+                // A viewer without control must follow the host's play state.
+                if (!canControl && !playing) {
+                  const player = getPlayer();
+                  if (player && typeof player.pauseVideo === 'function') player.pauseVideo();
+                  else if (player && typeof player.pause === 'function') player.pause();
+                  return;
+                }
+                setAutoplayBlocked(false);
+                onPlayPause?.(true);
+              }}
+              onPause={() => {
+                playingRef.current = false;
+                // A viewer without control stays on the room's play state.
+                if (!canControl) {
+                  reassertRoomState();
+                  return;
+                }
+                onPlayPause?.(false);
+              }}
               onEnded={() => onPlayPause?.(false)}
               onProgress={(state) => onProgress?.(Number(state.playedSeconds || 0))}
               onDuration={(seconds) => onDuration?.(Number(seconds || 0))}
-              onSeek={(seconds) => onSeek?.(Number(seconds || 0))}
+              onSeek={(seconds) => {
+                if (!canControl) {
+                  reassertRoomState();
+                  return;
+                }
+                reportSeek(Number(seconds || 0));
+              }}
               onError={(playerError) => {
                 const message = playerError?.message || 'This video could not be played.';
                 setLocalError(message);
@@ -217,6 +383,7 @@ export default function VideoPlayer({
               </div>
             </div>
           )}
+          </div>
           {autoplayBlocked ? (
             <button
               type="button"
@@ -226,12 +393,29 @@ export default function VideoPlayer({
               Click to start playback
             </button>
           ) : null}
+          {showUnmute ? (
+            <button
+              type="button"
+              className="absolute bottom-3 left-3 z-10 flex h-9 w-fit items-center justify-center gap-1.5 rounded-md bg-black/75 px-3 text-xs font-medium text-white"
+              onClick={handleUnmute}
+            >
+              <VolumeX className="h-3.5 w-3.5" />
+              Click to Unmute
+            </button>
+          ) : null}
           {loading ? <div role="status" aria-label="Loading video" className="absolute inset-0 animate-pulse bg-zinc-950/60" /> : null}
         </div>
         <div className="flex flex-wrap items-center justify-between gap-2 border-t border-zinc-200/80 px-3 py-2 dark:border-zinc-800">
           <div className="flex flex-wrap items-center gap-1.5">
             <Badge tone={url ? 'accent' : 'neutral'} dot>{isStream ? streamName || 'Drive stream' : url ? 'Video link' : 'No source'}</Badge>
-            {durationLabel ? <Badge><Clock className="h-3 w-3" />{durationLabel}</Badge> : null}
+            {url ? (
+              <Badge className="tabular-nums">
+                <Clock className="h-3 w-3" />
+                <span className="inline-block w-11 text-right">{positionLabel}</span>
+                <span className="text-zinc-400">/</span>
+                <span className="inline-block w-11 text-left">{durationLabel || '--:--'}</span>
+              </Badge>
+            ) : null}
             {url ? <Badge tone={playing ? 'success' : 'warning'} dot>{playing ? 'Playing' : 'Paused'}</Badge> : null}
           </div>
           <div className="flex items-center gap-1.5 text-[11px] text-zinc-500 dark:text-zinc-400">
