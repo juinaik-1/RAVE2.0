@@ -26,6 +26,10 @@ import { cn } from '../utils/cn';
 import { acknowledgeConvertedVideo, getConvertRequestId, openConvertTab, subscribeConvertedVideo } from '../utils/roomBridge';
 
 const DISPLAY_NAME_KEY = 'Nook-display-name';
+// A handoff that was published long ago belongs to a conversion the room has
+// already moved on from. A tab that was suspended in the background can still
+// receive it, so an old handoff is ignored.
+const MAX_HANDOFF_AGE_MS = 15 * 60_000;
 
 export default function Room() {
   const navigate = useNavigate();
@@ -93,12 +97,17 @@ export default function Room() {
     if (isHost) updatePresence({ hostOnlyControls: value });
   };
 
-  // Identifies this tab as the one that asked for a conversion, so the
-  // finished video is only applied by the tab that started it.
+  // Identifies the conversion this tab asked for. The room id is what scopes
+  // the handoff, so the request id only has to be consistent between the two
+  // tabs, not exclusive to this one.
   const convertRequestId = useRef('');
   if (!convertRequestId.current) convertRequestId.current = getConvertRequestId(roomKey);
   // The conversion tab, so the room can confirm it picked up the video.
   const convertWindowRef = useRef(null);
+  // The stream handed over by the conversion tab. Every load mints a new
+  // signed URL and restarts the playback, so the same stream is only applied
+  // once.
+  const appliedConvertRef = useRef('');
 
   const video = useVideoSync({
     roomId: roomKey,
@@ -116,25 +125,54 @@ export default function Room() {
   }, [isConnected, video.requestState]);
 
   // A conversion runs in its own tab and sends the finished video back here.
-  // Only the tab that started the conversion applies it; every other
-  // participant receives it through the room broadcast.
+  //
+  // The room id decides which room the video belongs to. The request id is
+  // deliberately not used as a filter: a room tab that was refreshed, or that
+  // was opened in a browser which did not keep its sessionStorage, no longer
+  // knows the id it issued, and dropping the video there would leave the room
+  // playing the old one. Any tab of the room applies the handoff and announces
+  // it, so the room still converges on the new video when the tab that started
+  // the conversion is gone.
   useEffect(() => {
     const unsubscribe = subscribeConvertedVideo((message) => {
       if (!message || message.roomId !== roomKey) return;
-      if (message.requestId && message.requestId !== convertRequestId.current) return;
       if (!message.streamId) return;
-      void video.shareConvertedVideo(
-        { streamId: message.streamId, name: message.name },
-        { autoplay: canControl },
-      );
-      // Confirm the video is ready so the room knows it is playing.
-      setReadyVideo(message.name || 'Converted video');
-      // Tell the conversion tab the room picked the video up.
-      acknowledgeConvertedVideo(
-        message.id,
-        { roomId: roomKey, streamId: message.streamId },
-        convertWindowRef.current,
-      );
+      if (message.at && Date.now() - Number(message.at) > MAX_HANDOFF_AGE_MS) return;
+      const confirm = () => {
+        acknowledgeConvertedVideo(
+          message.id,
+          { roomId: roomKey, streamId: message.streamId },
+          convertWindowRef.current,
+        );
+      };
+      if (appliedConvertRef.current === message.streamId) {
+        // Already playing here. Still confirm, so the conversion tab stops
+        // repeating the handoff.
+        confirm();
+        return;
+      }
+      const applyVideo = async () => {
+        // Claim it before the request goes out, so a repeated message cannot
+        // start a second load of the same stream.
+        appliedConvertRef.current = message.streamId;
+        try {
+          const applied = await video.shareConvertedVideo(
+            { streamId: message.streamId, name: message.name },
+            { autoplay: canControl },
+          );
+          if (!applied) {
+            appliedConvertRef.current = '';
+            return;
+          }
+          // Confirm the video is ready so the room knows it is playing.
+          setReadyVideo(message.name || 'Converted video');
+          confirm();
+        } catch {
+          // Let a later handoff try again.
+          appliedConvertRef.current = '';
+        }
+      };
+      void applyVideo();
     });
     return unsubscribe;
   }, [roomKey, canControl, video.shareConvertedVideo]);

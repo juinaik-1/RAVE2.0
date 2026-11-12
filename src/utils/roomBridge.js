@@ -69,24 +69,39 @@ function post(message, targetWindow) {
   }
 }
 
-// A stable id for this tab's conversion request, kept in sessionStorage so a
-// reload of the room tab still matches the conversion it started.
-export function getConvertRequestId(roomId) {
-  const key = `${CONVERT_REQUEST_KEY}:${roomId}`;
-  let id = '';
+function readStored(kind, key) {
   try {
-    id = window.sessionStorage.getItem(key) || '';
+    return window[kind].getItem(key) || '';
   } catch {
-    id = '';
+    return '';
   }
-  if (!id) {
-    id = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
-    try {
-      window.sessionStorage.setItem(key, id);
-    } catch {
-      /* ignore */
-    }
+}
+
+function writeStored(kind, key, value) {
+  try {
+    window[kind].setItem(key, value);
+  } catch {
+    /* ignore */
   }
+}
+
+function requestStorageKey(roomId) {
+  return `${CONVERT_REQUEST_KEY}:${roomId}`;
+}
+
+// A stable id for this tab's conversion request.
+export function getConvertRequestId(roomId) {
+  const key = requestStorageKey(roomId);
+  const fromSession = readStored('sessionStorage', key);
+  if (fromSession) return fromSession;
+  const fromLocal = readStored('localStorage', key);
+  if (fromLocal) {
+    writeStored('sessionStorage', key, fromLocal);
+    return fromLocal;
+  }
+  const id = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+  writeStored('sessionStorage', key, id);
+  writeStored('localStorage', key, id);
   return id;
 }
 

@@ -4,7 +4,10 @@ import { AlertCircle, ArrowLeft, CheckCircle2, Film, X, XCircle } from 'lucide-r
 import DriveSource from '../components/DriveSource';
 import { Badge, Button, Field, Panel, inputClass } from '../components/ui';
 import { useConversion } from '../hooks/useConversion';
-import { publishConvertedVideo, subscribeConvertedVideoAck } from '../utils/roomBridge';
+import { publishConvertedVideo, subscribeConvertedVideoAck, getConvertRequestId } from '../utils/roomBridge';
+
+const PUBLISH_RETRY_MS = 2000;
+const MAX_PUBLISH_ATTEMPTS = 15;
 
 export default function Convert() {
   const location = useLocation();
@@ -13,7 +16,7 @@ export default function Convert() {
   // The room tab opens this page in a separate tab so the room keeps playing.
   // These parameters carry that context across the tab boundary.
   const roomId = searchParams.get('room') || location.state?.roomId || '';
-  const requestId = searchParams.get('request') || '';
+  const [requestId, setRequestId] = useState(searchParams.get('request') || '');
   const streamParam = searchParams.get('stream') || '';
   const nameParam = searchParams.get('name') || '';
   const initialSource = location.state?.streamId
@@ -29,6 +32,8 @@ export default function Convert() {
   const [roomCode, setRoomCode] = useState(roomId);
   const [sentToRoom, setSentToRoom] = useState(false);
   const [roomReceived, setRoomReceived] = useState(false);
+  const roomReceivedRef = useRef(false);
+  const publishedStreamRef = useRef('');
   const { job, error, start, convert, cancel } = useConversion();
   const busy = Boolean(job && ['queued', 'downloading', 'analyzing', 'converting'].includes(job.status));
   const startedRef = useRef(false);
@@ -65,26 +70,52 @@ export default function Convert() {
     void start({ streamId: initialSource.streamId }, { autoStart: true, resolution: 'original' });
   }, [initialSource, start]);
 
+  useEffect(() => {
+    if (requestId || !roomId) return;
+    setRequestId(getConvertRequestId(roomId));
+  }, [requestId, roomId]);
+
   // Listen for the room tab confirming it applied the video. This is
   // registered before the video is published so the reply is never missed.
   useEffect(() => {
     return subscribeConvertedVideoAck((ack) => {
-      if (ack?.streamId && ack.streamId === job?.outputStreamId) setRoomReceived(true);
+      if (ack?.streamId && ack.streamId === job?.outputStreamId) {
+        roomReceivedRef.current = true;
+        setRoomReceived(true);
+      }
     });
   }, [job?.outputStreamId]);
 
-  // Hand the finished video to the room tab that asked for it.
+  // Hand the finished video to the room tab that asked for it. The message is
+  // repeated until the room confirms it, so a room tab that was reloading at
+  // that exact moment still receives the handoff.
   useEffect(() => {
-    if (job?.status !== 'done' || !job.outputStreamId || sentToRoom) return;
-    if (!roomId) return;
+    if (job?.status !== 'done' || !job.outputStreamId || !roomId || !requestId) return undefined;
+    const streamId = job.outputStreamId;
+    if (publishedStreamRef.current === streamId) return undefined;
+    publishedStreamRef.current = streamId;
+    const name = job.sourceName || 'Converted video';
+    let attempts = 0;
+    let cancelled = false;
+    const publish = () => {
+      if (cancelled || roomReceivedRef.current) return;
+      attempts += 1;
+      publishConvertedVideo({ roomId, requestId, streamId, name });
+    };
     setSentToRoom(true);
-    publishConvertedVideo({
-      roomId,
-      requestId,
-      streamId: job.outputStreamId,
-      name: job.sourceName || 'Converted video',
-    });
-  }, [job, roomId, requestId, sentToRoom]);
+    publish();
+    const timer = window.setInterval(() => {
+      if (roomReceivedRef.current || attempts >= MAX_PUBLISH_ATTEMPTS) {
+        window.clearInterval(timer);
+        return;
+      }
+      publish();
+    }, PUBLISH_RETRY_MS);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [job, roomId, requestId]);
 
   const focusRoomTab = () => {
     try {
