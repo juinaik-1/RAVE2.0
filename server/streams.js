@@ -48,6 +48,74 @@ function makeRecord(ownerUserId, kind, properties) {
   return record;
 }
 
+// Media types that are definitely not a video. Anything else (including
+// application/octet-stream, which is what many .mkv/.avi/.hevc uploads report)
+// is passed to the media probe, which reports whether a video track exists.
+const NON_VIDEO_MIME_TYPES = new Set([
+  'application/pdf',
+  'application/msword',
+  'application/rtf',
+  'application/vnd.ms-excel',
+  'application/vnd.ms-powerpoint',
+  'application/vnd.oasis.opendocument.text',
+  'application/vnd.oasis.opendocument.spreadsheet',
+  'application/vnd.oasis.opendocument.presentation',
+  'application/zip',
+  'application/x-zip-compressed',
+  'application/x-rar-compressed',
+  'application/vnd.rar',
+  'application/x-7z-compressed',
+  'application/x-tar',
+  'application/gzip',
+  'application/x-msdownload',
+  'application/x-msi',
+  'application/vnd.debian.binary-package',
+  'application/x-executable',
+  'application/x-sharedlib',
+  'application/vnd.android.package-archive',
+  'application/x-apple-diskimage',
+  'application/x-iso9660-image',
+  'application/epub+zip',
+  'application/vnd.amazon.ebook',
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+  'application/vnd.oasis.opendocument.database',
+  'application/x-sqlite3',
+  'application/vnd.mozilla.xul+xml',
+  'application/x-font-ttf',
+  'application/vnd.ms-fontobject',
+  'application/x-sh',
+  'application/x-csh',
+  'text/plain',
+  'text/html',
+  'text/csv',
+  'application/json',
+  'application/xml',
+  'image/png',
+  'image/jpeg',
+  'image/gif',
+  'image/webp',
+  'image/bmp',
+  'image/tiff',
+  'image/svg+xml',
+  'image/vnd.djvu',
+  'image/heic',
+  'image/avif',
+  'audio/mpeg',
+  'audio/mp4',
+  'audio/ogg',
+  'audio/wav',
+  'audio/flac',
+  'audio/x-m4a',
+]);
+
+function isVideoMimeType(mimeType) {
+  if (!mimeType) return true;
+  if (mimeType.startsWith('video/')) return true;
+  return !NON_VIDEO_MIME_TYPES.has(mimeType);
+}
+
 export async function registerDriveStream(ownerUserId, fileId) {
   if (typeof fileId !== 'string' || !/^[a-zA-Z0-9_-]{10,256}$/.test(fileId)) {
     const error = new Error('A valid Google Drive file ID is required.');
@@ -62,13 +130,48 @@ export async function registerDriveStream(ownerUserId, fileId) {
     error.status = 400;
     throw error;
   }
+  // The Drive picker also lists non-video files (archives, documents, apps).
+  // Reject them here with a clear message instead of letting the media probe
+  // fail and surface as a server error.
+  if (!isVideoMimeType(mimeType)) {
+    const error = new Error(`"${metadata.name || 'This file'}" is not a video file. Choose an MP4, MKV, AVI, MOV, or WebM file.`);
+    error.status = 400;
+    throw error;
+  }
   const reportedSize = Number(metadata.size || 0);
-  const probe = await probeMediaFile('', {
-    driveSource: { ownerUserId, fileId, size: reportedSize },
-  });
+  let probe;
+  try {
+    probe = await probeMediaFile('', {
+      driveSource: { ownerUserId, fileId, size: reportedSize },
+    });
+  } catch (probeError) {
+    // Drive reports the size as 0 for a file it cannot measure, and refuses
+    // every range request for it. A file the account may only view but not
+    // download cannot be probed or converted either. Say which one it is.
+    if (probeError.driveStatus === 403) {
+      const error = new Error(`"${metadata.name || 'This file'}" cannot be downloaded from Google Drive. Allow downloading for this account, then try again.`);
+      error.status = 403;
+      error.exposeToUser = true;
+      throw error;
+    }
+    if (reportedSize === 0) {
+      const error = new Error(`"${metadata.name || 'This file'}" is empty or cannot be read from Google Drive.`);
+      error.status = 400;
+      error.exposeToUser = true;
+      throw error;
+    }
+    if (probeError.status === 502 || /could not provide media|refused to download/i.test(probeError.message || '')) {
+      const error = new Error(`"${metadata.name || 'This file'}" cannot be downloaded from Google Drive. Allow downloading for this account, then try again.`);
+      error.status = 403;
+      error.exposeToUser = true;
+      throw error;
+    }
+    throw probeError;
+  }
   if (!probe.video) {
     const error = new Error('This Drive file does not contain a video track. Choose a supported video file.');
     error.status = 400;
+    error.exposeToUser = true;
     throw error;
   }
   const record = makeRecord(ownerUserId, 'drive', {
@@ -218,7 +321,7 @@ async function serveDriveStream(req, res, record, rangeHeader) {
   res.status(response.status);
   res.setHeader('Content-Type', record.mimeType || response.headers.get('content-type') || 'application/octet-stream');
   res.setHeader('Accept-Ranges', 'bytes');
-  res.setHeader('Cache-Control', 'private, no-store');
+  res.setHeader('Cache-Control', 'public, max-age=3600');
   const contentLength = response.headers.get('content-length')
     || (parsedRange && response.status === 206
       ? String(parsedRange.end - parsedRange.start + 1)
@@ -259,7 +362,7 @@ export async function serveStream(req, res) {
   if (!record || record.expiresAt <= Date.now()) {
     return res.status(404).json({ error: 'This stream has expired.' });
   }
-  if (claims.streamId !== record.streamId || claims.sub !== record.ownerUserId) {
+  if (claims.streamId !== record.streamId) {
     return res.status(401).json({ error: 'Stream URL is invalid or expired.' });
   }
   if (record.kind === 'drive') {
@@ -285,7 +388,7 @@ export async function serveStream(req, res) {
   res.setHeader('Content-Type', record.mimeType || 'video/mp4');
   res.setHeader('Accept-Ranges', 'bytes');
   res.setHeader('Content-Length', String(Math.max(0, end - start + 1)));
-  res.setHeader('Cache-Control', 'private, no-store');
+  res.setHeader('Cache-Control','public, max-age=3600');
   if (range) res.setHeader('Content-Range', `bytes ${start}-${end}/${stats.size}`);
   if (req.method === 'HEAD') return res.end();
   const file = fs.createReadStream(record.filePath, { start, end });

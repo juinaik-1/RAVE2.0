@@ -4,6 +4,7 @@ import {
   AlertCircle,
   Check,
   Copy,
+  Film,
   LogOut,
   Play,
   RefreshCw,
@@ -22,6 +23,7 @@ import { useTheme } from '../hooks/useTheme';
 import { useVideoSync } from '../hooks/useVideoSync';
 import { useVoice } from '../hooks/useVoice';
 import { cn } from '../utils/cn';
+import { acknowledgeConvertedVideo, getConvertRequestId, openConvertTab, subscribeConvertedVideo } from '../utils/roomBridge';
 
 const DISPLAY_NAME_KEY = 'Nook-display-name';
 
@@ -39,6 +41,15 @@ export default function Room() {
   const [displayName, setDisplayName] = useState(storedName);
   const [hostOnlyControls, setHostOnlyControls] = useState(false);
   const [copyStatus, setCopyStatus] = useState('');
+  const [readyVideo, setReadyVideo] = useState('');
+
+  // A finished conversion is announced with a short toast. It clears itself so
+  // a stale message never lingers in the room.
+  useEffect(() => {
+    if (!readyVideo) return undefined;
+    const timer = window.setTimeout(() => setReadyVideo(''), 6000);
+    return () => window.clearTimeout(timer);
+  }, [readyVideo]);
 
   useEffect(() => {
     if (typeof window !== 'undefined') {
@@ -82,6 +93,13 @@ export default function Room() {
     if (isHost) updatePresence({ hostOnlyControls: value });
   };
 
+  // Identifies this tab as the one that asked for a conversion, so the
+  // finished video is only applied by the tab that started it.
+  const convertRequestId = useRef('');
+  if (!convertRequestId.current) convertRequestId.current = getConvertRequestId(roomKey);
+  // The conversion tab, so the room can confirm it picked up the video.
+  const convertWindowRef = useRef(null);
+
   const video = useVideoSync({
     roomId: roomKey,
     channel,
@@ -96,6 +114,40 @@ export default function Room() {
   useEffect(() => {
     if (isConnected) video.requestState();
   }, [isConnected, video.requestState]);
+
+  // A conversion runs in its own tab and sends the finished video back here.
+  // Only the tab that started the conversion applies it; every other
+  // participant receives it through the room broadcast.
+  useEffect(() => {
+    const unsubscribe = subscribeConvertedVideo((message) => {
+      if (!message || message.roomId !== roomKey) return;
+      if (message.requestId && message.requestId !== convertRequestId.current) return;
+      if (!message.streamId) return;
+      void video.shareConvertedVideo(
+        { streamId: message.streamId, name: message.name },
+        { autoplay: canControl },
+      );
+      // Confirm the video is ready so the room knows it is playing.
+      setReadyVideo(message.name || 'Converted video');
+      // Tell the conversion tab the room picked the video up.
+      acknowledgeConvertedVideo(
+        message.id,
+        { roomId: roomKey, streamId: message.streamId },
+        convertWindowRef.current,
+      );
+    });
+    return unsubscribe;
+  }, [roomKey, canControl, video.shareConvertedVideo]);
+
+  // Open the conversion page in a separate tab so the room keeps playing.
+  const openConverter = (stream) => {
+    convertWindowRef.current = openConvertTab({
+      roomId: roomKey,
+      requestId: convertRequestId.current,
+      streamId: stream?.streamId,
+      name: stream?.name,
+    });
+  };
 
   useEffect(() => {
     const sharedStream = location.state?.streamId;
@@ -263,14 +315,13 @@ export default function Room() {
               onLoadVideo={video.loadVideo}
               onReady={video.handleReady}
               onVideoError={video.handleVideoError}
+              onConvert={openConverter}
             />
 
             {user ? (
               <DriveSource
                 onLoadStream={video.loadStream}
-                onConvert={(stream) => navigate('/convert', {
-                  state: { streamId: stream.streamId, name: stream.name, roomId: roomKey },
-                })}
+                onConvert={openConverter}
               />
             ) : (
               <p className="rounded-md border border-zinc-200/80 bg-white px-3 py-2 text-xs text-zinc-600 dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-400">
@@ -328,7 +379,10 @@ export default function Room() {
       {copyStatus ? (
         <div
           role="status"
-          className="fixed bottom-4 left-4 right-4 z-50 mx-auto flex max-w-sm items-start gap-2 rounded-md border border-zinc-200/80 bg-white px-3 py-2.5 text-xs leading-5 text-zinc-600 shadow-sm dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-300 sm:left-auto sm:right-6 sm:mx-0"
+          className={cn(
+            'fixed left-4 right-4 z-50 mx-auto flex max-w-sm items-start gap-2 rounded-md border border-zinc-200/80 bg-white px-3 py-2.5 text-xs leading-5 text-zinc-600 shadow-sm dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-300 sm:left-auto sm:right-6 sm:mx-0',
+            readyVideo ? 'bottom-28' : 'bottom-4',
+          )}
         >
           {copySucceeded ? (
             <Check className="mt-0.5 h-3.5 w-3.5 shrink-0 text-emerald-500" strokeWidth={2} />
@@ -336,6 +390,18 @@ export default function Room() {
             <AlertCircle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-red-500" strokeWidth={1.75} />
           )}
           <span className="min-w-0 break-words">{copyStatus}</span>
+        </div>
+      ) : null}
+
+      {readyVideo ? (
+        <div
+          role="status"
+          className="fixed bottom-4 left-4 right-4 z-50 mx-auto flex max-w-sm items-start gap-2 rounded-md border border-emerald-200/80 bg-emerald-50 px-3 py-2.5 text-xs leading-5 text-emerald-800 shadow-sm dark:border-emerald-900/60 dark:bg-emerald-950/30 dark:text-emerald-300 sm:left-auto sm:right-6 sm:mx-0"
+        >
+          <Film className="mt-0.5 h-3.5 w-3.5 shrink-0 text-emerald-500" strokeWidth={2} />
+          <span className="min-w-0 break-words">
+            New video ready: <span className="font-medium">{readyVideo}</span>
+          </span>
         </div>
       ) : null}
     </div>

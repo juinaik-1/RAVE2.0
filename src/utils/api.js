@@ -2,7 +2,10 @@ const SESSION_TOKEN_KEY = 'Nook-session-token';
 const DEFAULT_API_BASE = 'http://localhost:3001';
 
 export function getApiBase() {
-  return String(import.meta.env.VITE_API_URL || DEFAULT_API_BASE).replace(/\/+$/, '');
+  // VITE_API_URL is the documented name; VITE_CONVERT_API_URL is accepted as
+  // an alias so existing local setups keep pointing at the right server.
+  const configured = import.meta.env.VITE_API_URL || import.meta.env.VITE_CONVERT_API_URL;
+  return String(configured || DEFAULT_API_BASE).replace(/\/+$/, '');
 }
 
 export function getSessionToken() {

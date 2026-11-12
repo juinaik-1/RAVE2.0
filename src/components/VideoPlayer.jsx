@@ -1,7 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import ReactPlayer from 'react-player';
 import { Clock, Link2, MonitorPlay, Radio, VolumeX, WandSparkles } from 'lucide-react';
-import { useNavigate } from 'react-router-dom';
 import { Badge, Button, Panel, inputClass } from './ui';
 import { normalizeVideoUrl } from '../utils/videoUrl';
 import { cn } from '../utils/cn';
@@ -27,8 +26,8 @@ function formatTimestamp(value) {
 export default function VideoPlayer({
   url, streamId, streamName, playing, time, roomTime, duration = 0, canControl, canConvert = true,
   loading, error, syncNonce = 0, onPlayPause, onSeek, onProgress, onDuration, onLoadVideo, onVideoError, onReady,
+  onConvert,
 }) {
-  const navigate = useNavigate();
   const playerRef = useRef(null);
   const [inputValue, setInputValue] = useState('');
   const [localError, setLocalError] = useState('');
@@ -440,7 +439,8 @@ export default function VideoPlayer({
           <Button
             type="button"
             variant="ghost"
-            onClick={() => navigate('/convert', { state: { roomId: window.location.pathname.split('/').pop() } })}
+            title="Convert a video in a new tab so the room keeps playing"
+            onClick={() => (onConvert ? onConvert() : window.open('/convert', '_blank'))}
           >
             <WandSparkles className="h-4 w-4" /> Convert
           </Button>

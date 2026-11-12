@@ -336,6 +336,21 @@ async function prepareSource(job) {
   job.duration = analysis.duration;
   job.video = analysis.video;
   job.sourceName = stream?.name || (job.source.url ? new URL(job.source.url).hostname : 'Drive video');
+  if (job.requestedOptions) {
+    // The options were supplied up front, so the job converts without waiting
+    // for the interactive options step.
+    const requestedTrack = job.requestedOptions.audioTrack;
+    const audioTrack = requestedTrack === undefined || requestedTrack === null
+      ? job.audioTracks[0]?.index ?? null
+      : job.audioTracks.some((track) => track.index === Number(requestedTrack))
+        ? Number(requestedTrack)
+        : job.audioTracks[0]?.index ?? null;
+    job.conversionOptions = { audioTrack, resolution: job.requestedOptions.resolution || 'original' };
+    job.status = 'queued';
+    job.message = 'Queued for conversion';
+    job.progress = 40;
+    return;
+  }
   job.status = 'awaiting_options';
   job.message = 'Choose an audio track and resolution to continue';
   job.progress = 40;
@@ -357,7 +372,10 @@ function processQueue() {
   activeJobId = id;
   (async () => {
     if (!job.sourcePath) await prepareSource(job);
-    else await convertPreparedJob(job, runProcess);
+    // A job that already knows its options (either chosen by the user or
+    // supplied up front) converts straight away instead of waiting for the
+    // interactive options step.
+    if (job.conversionOptions) await convertPreparedJob(job, runProcess);
   })().catch((error) => {
     if (error.cancelled || job.status === 'cancelled') {
       job.status = 'cancelled';
@@ -385,12 +403,29 @@ function checkQueueCapacity() {
   }
 }
 
-export async function createJob(ownerUserId, source) {
+export async function createJob(ownerUserId, source, options = {}) {
   if (!source || (typeof source.streamId !== 'string' && typeof source.url !== 'string')) {
     const error = new Error('Choose a registered Drive video or provide a source URL.');
     error.status = 400;
     throw error;
   }
+  const resolution = options?.resolution || 'original';
+  if (!['original', '720', '1080'].includes(String(resolution))) {
+    const error = new Error('Resolution must be original, 720, or 1080.');
+    error.status = 400;
+    throw error;
+  }
+  // Only skip the interactive options step when the caller asks for it. The
+  // interactive flow still stops at "awaiting_options" so the user can pick an
+  // audio track and a resolution.
+  const requestedOptions = options?.autoStart
+    ? {
+      audioTrack: options?.audioTrack === undefined || options?.audioTrack === null
+        ? null
+        : Number(options.audioTrack),
+      resolution: String(resolution),
+    }
+    : null;
   let normalizedSource;
   if (source.streamId) {
     const record = getStream(source.streamId);
@@ -429,6 +464,7 @@ export async function createJob(ownerUserId, source) {
     duration: 0,
     video: null,
     conversionOptions: null,
+    requestedOptions,
     outputStreamId: null,
     cancelCurrent: null,
   };

@@ -31,9 +31,17 @@ function ffmpegArguments(job, outputPath) {
   }
 
   if (audio) {
-    if (copyAudio) args.push('-c:a', 'copy');
-    else args.push('-c:a', 'aac', '-b:a', '128k', '-ac', '2');
+  if (copyAudio) {
+    args.push('-c:a', 'copy');
+  } else {
+    // 192k bitrate + proper ITU-R BS.775 stereo downmix filter
+    args.push(
+      '-c:a', 'aac',
+      '-b:a', '192k',
+      '-af', 'pan=stereo|FL < 1.0*FL + 0.707*FC + 0.707*BL|FR < 1.0*FR + 0.707*FC + 0.707*BR'
+    );
   }
+}
   if (!copyVideo) args.push('-threads:v', '4');
   args.push('-movflags', '+faststart', '-f', 'mp4', outputPath);
   return { args, copyVideo, copyAudio };

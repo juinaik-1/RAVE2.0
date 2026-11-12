@@ -182,10 +182,19 @@ export function useVideoSync({
 
     const applyRemoteStream = async (payload) => {
       if (!payload || payload.roomId !== roomId) return;
+      const current = currentRef.current;
+      // Loading the stream that is already playing would restart it, so only
+      // the play state is applied for a repeated load of the same source.
+      const isSameStream = payload.type === 'stream'
+        && payload.streamId
+        && payload.streamId === current.streamId
+        && Boolean(current.videoUrl);
       applyingRemoteRef.current = true;
-      const loaded = payload.type === 'stream'
-        ? await applyStream(payload.streamId, payload.name)
-        : payload.type === 'url' && applyUrl(payload.url);
+      const loaded = isSameStream
+        ? true
+        : payload.type === 'stream'
+          ? await applyStream(payload.streamId, payload.name)
+          : payload.type === 'url' && applyUrl(payload.url);
       if (loaded && Number.isFinite(Number(payload.time))) {
         currentRef.current = { ...currentRef.current, time: Number(payload.time) };
         setTime(Number(payload.time));
@@ -311,6 +320,32 @@ export function useVideoSync({
     }
   }, [applyStream, canControl, channel, roomId]);
 
+  // Share a finished conversion with the room. The video:load broadcast reaches
+  // every participant in the room, including the host's tab, so the room
+  // switches to the new video no matter which tab ran the conversion.
+  // `autoplay` is false when the requester cannot control playback, so the
+  // host still decides when the room starts.
+  const shareConvertedVideo = useCallback(async (stream, { autoplay = false } = {}) => {
+    if (!stream?.streamId) return false;
+    const loaded = await applyStream(stream.streamId, stream.name);
+    if (!loaded) return false;
+    if (roomId && channel) {
+      sendRef.current('video:load', {
+        roomId,
+        type: 'stream',
+        streamId: stream.streamId,
+        name: stream.name || 'Video',
+        ...(autoplay ? { playing: true } : {}),
+      });
+    }
+    if (autoplay) {
+      currentRef.current = { ...currentRef.current, playing: true };
+      setPlaying(true);
+    }
+    setSyncNonce((value) => value + 1);
+    return true;
+  }, [applyStream, channel, roomId]);
+
   const loadVideo = useCallback((nextUrl) => {
     if (!canControl) return;
     const normalized = normalizeVideoUrl(nextUrl);
@@ -420,6 +455,7 @@ export function useVideoSync({
     syncNonce,
     loadVideo,
     loadStream,
+    shareConvertedVideo,
     handleReady,
     handlePlayPause,
     handleSeek,

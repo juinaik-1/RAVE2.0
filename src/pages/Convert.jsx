@@ -1,24 +1,37 @@
-import { useMemo, useState } from 'react';
-import { useLocation, useNavigate } from 'react-router-dom';
-import { AlertCircle, ArrowLeft, CheckCircle2, Film, ShieldCheck, XCircle } from 'lucide-react';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import { useLocation, useNavigate, useSearchParams } from 'react-router-dom';
+import { AlertCircle, ArrowLeft, CheckCircle2, Film, X, XCircle } from 'lucide-react';
 import DriveSource from '../components/DriveSource';
 import { Badge, Button, Field, Panel, inputClass } from '../components/ui';
 import { useConversion } from '../hooks/useConversion';
+import { publishConvertedVideo, subscribeConvertedVideoAck } from '../utils/roomBridge';
 
 export default function Convert() {
   const location = useLocation();
   const navigate = useNavigate();
+  const [searchParams] = useSearchParams();
+  // The room tab opens this page in a separate tab so the room keeps playing.
+  // These parameters carry that context across the tab boundary.
+  const roomId = searchParams.get('room') || location.state?.roomId || '';
+  const requestId = searchParams.get('request') || '';
+  const streamParam = searchParams.get('stream') || '';
+  const nameParam = searchParams.get('name') || '';
   const initialSource = location.state?.streamId
     ? { streamId: location.state.streamId, name: location.state.name || 'Drive video' }
-    : null;
+    : streamParam
+      ? { streamId: streamParam, name: nameParam || 'Drive video' }
+      : null;
   const [sourceType, setSourceType] = useState(initialSource ? 'drive' : 'url');
   const [source, setSource] = useState(initialSource);
   const [url, setUrl] = useState('');
   const [audioTrack, setAudioTrack] = useState('');
   const [resolution, setResolution] = useState('original');
-  const [roomCode, setRoomCode] = useState(location.state?.roomId || '');
+  const [roomCode, setRoomCode] = useState(roomId);
+  const [sentToRoom, setSentToRoom] = useState(false);
+  const [roomReceived, setRoomReceived] = useState(false);
   const { job, error, start, convert, cancel } = useConversion();
   const busy = Boolean(job && ['queued', 'downloading', 'analyzing', 'converting'].includes(job.status));
+  const startedRef = useRef(false);
   const stage = useMemo(() => {
     if (!job) return '';
     if (job.status === 'downloading') return 'Downloading';
@@ -40,9 +53,86 @@ export default function Convert() {
     start({ url: url.trim() });
   };
 
+  // The room tab opens this page in a separate tab with the source already
+  // picked. Start the job right away so the room can keep playing instead of
+  // waiting for two extra clicks.
+  useEffect(() => {
+    if (startedRef.current) return;
+    if (!initialSource?.streamId) return;
+    startedRef.current = true;
+    // The options are supplied up front, so the server converts as soon as the
+    // source is analysed instead of pausing for an options round-trip.
+    void start({ streamId: initialSource.streamId }, { autoStart: true, resolution: 'original' });
+  }, [initialSource, start]);
+
+  // Listen for the room tab confirming it applied the video. This is
+  // registered before the video is published so the reply is never missed.
+  useEffect(() => {
+    return subscribeConvertedVideoAck((ack) => {
+      if (ack?.streamId && ack.streamId === job?.outputStreamId) setRoomReceived(true);
+    });
+  }, [job?.outputStreamId]);
+
+  // Hand the finished video to the room tab that asked for it.
+  useEffect(() => {
+    if (job?.status !== 'done' || !job.outputStreamId || sentToRoom) return;
+    if (!roomId) return;
+    setSentToRoom(true);
+    publishConvertedVideo({
+      roomId,
+      requestId,
+      streamId: job.outputStreamId,
+      name: job.sourceName || 'Converted video',
+    });
+  }, [job, roomId, requestId, sentToRoom]);
+
+  const focusRoomTab = () => {
+    try {
+      if (window.opener && !window.opener.closed) {
+        window.opener.focus();
+        return true;
+      }
+    } catch {
+      /* ignore */
+    }
+    return false;
+  };
+
+  // Close the conversion tab. The room tab keeps playing, so the user just
+  // switches back to it. Browsers only allow window.close() for tabs that were
+  // opened by script, so fall back to a blank page when that is refused.
+  const closeTab = () => {
+    try {
+      window.close();
+    } catch {
+      /* ignore */
+    }
+    // If the tab did not close, replace it with a minimal page so it does not
+    // keep polling the job.
+    window.setTimeout(() => {
+      if (!window.closed) {
+        document.body.innerHTML = '';
+        window.location.replace('about:blank');
+      }
+    }, 200);
+  };
+
   const share = () => {
     const code = roomCode.trim().toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 6);
     if (!code || !job?.outputStreamId) return;
+    // If the room tab is still open, hand the video over instead of loading it
+    // again in this tab.
+    if (roomId === code && !sentToRoom) {
+      publishConvertedVideo({
+        roomId: code,
+        requestId,
+        streamId: job.outputStreamId,
+        name: job.sourceName || 'Converted video',
+      });
+      setSentToRoom(true);
+      focusRoomTab();
+      return;
+    }
     navigate(`/room/${code}`, {
       state: { streamId: job.outputStreamId, name: job.sourceName || 'Converted video' },
     });
@@ -56,10 +146,22 @@ export default function Convert() {
     });
   };
 
+  const back = () => {
+    if (focusRoomTab()) return;
+    // This tab was opened from the room, so go straight back to it when the
+    // opener cannot be focused. A plain history back does nothing here
+    // because the tab has no earlier entry of its own.
+    if (roomId) {
+      navigate(`/room/${roomId}`);
+      return;
+    }
+    navigate(-1);
+  };
+
   return (
     <main className="min-h-screen bg-zinc-50 px-4 py-8 dark:bg-zinc-950 sm:px-6">
       <div className="mx-auto max-w-2xl">
-        <Button variant="ghost" size="sm" onClick={() => navigate(-1)}>
+        <Button variant="ghost" size="sm" onClick={back}>
           <ArrowLeft className="h-4 w-4" /> Back
         </Button>
         <h1 className="mt-5 flex items-center gap-2 text-2xl font-semibold tracking-tight text-zinc-900 dark:text-zinc-100">
@@ -69,10 +171,12 @@ export default function Convert() {
           Convert Drive videos in formats such as MKV, AVI, or HEVC, or provide a video URL, into a shareable H.264 MP4.
         </p>
 
-        <div className="mt-5 flex items-start gap-2 rounded-md border border-amber-200 bg-amber-50 p-3 text-xs leading-5 text-amber-900 dark:border-amber-900/60 dark:bg-amber-950/30 dark:text-amber-200">
-          <ShieldCheck className="mt-0.5 h-4 w-4 shrink-0" />
-          Use this tool only for videos you own or are authorized to share.
-        </div>
+        {roomId ? (
+          <p className="mt-4 rounded-md border border-zinc-200/80 bg-white px-3 py-2 text-xs leading-5 text-zinc-600 dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-400">
+            Converting in this tab so room <span className="font-mono font-medium text-zinc-900 dark:text-zinc-100">{roomId}</span> keeps playing.
+            The finished video is sent to the room automatically.
+          </p>
+        ) : null}
 
         {!busy && !['awaiting_options', 'done'].includes(job?.status) ? (
           <Panel className="mt-5 space-y-5 p-5">
@@ -194,19 +298,39 @@ export default function Convert() {
             <p className="flex items-center gap-2 text-sm font-medium text-emerald-700 dark:text-emerald-400">
               <CheckCircle2 className="h-4 w-4" /> Conversion complete
             </p>
-            <Field className="mt-4" label="Room code" htmlFor="share-room" hint="Enter the room where you want to share this video.">
-              <input
-                id="share-room"
-                className={inputClass}
-                value={roomCode}
-                onChange={(event) => setRoomCode(event.target.value.toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 6))}
-                maxLength={6}
-                placeholder="ABC123"
-              />
-            </Field>
-            <Button className="mt-4 w-full" onClick={share} disabled={roomCode.length < 4}>
-              Share to room
-            </Button>
+            {sentToRoom && roomId ? (
+              <>
+                <p className="mt-2 text-sm text-zinc-600 dark:text-zinc-400">
+                  {roomReceived
+                    ? 'The video is now playing in the room.'
+                    : 'The video was sent to the room tab. Switch back to see it.'}
+                </p>
+                <Button className="mt-4 w-full" onClick={closeTab}>
+                  <X className="h-4 w-4" /> Close this tab
+                </Button>
+                {!roomReceived ? (
+                  <Button className="mt-2 w-full" variant="secondary" onClick={share} disabled={roomCode.length < 4}>
+                    Open room {roomCode || '…'} instead
+                  </Button>
+                ) : null}
+              </>
+            ) : (
+              <>
+                <Field className="mt-4" label="Room code" htmlFor="share-room" hint="Enter the room where you want to share this video.">
+                  <input
+                    id="share-room"
+                    className={inputClass}
+                    value={roomCode}
+                    onChange={(event) => setRoomCode(event.target.value.toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 6))}
+                    maxLength={6}
+                    placeholder="ABC123"
+                  />
+                </Field>
+                <Button className="mt-4 w-full" onClick={share} disabled={roomCode.length < 4}>
+                  Share to room
+                </Button>
+              </>
+            )}
           </Panel>
         ) : null}
 
