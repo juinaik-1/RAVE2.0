@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { config } from './config.js';
 import { probeMediaFile } from './probe.js';
+import { killProcessTree } from './processPriority.js';
 import { createConvertedStream } from './streams.js';
 import { ensureFreeDiskSpace } from './security.js';
 
@@ -14,9 +15,12 @@ function ffmpegArguments(job, outputPath) {
     && job.video.pixelFormat === 'yuv420p'
     && !needsScale;
   const copyAudio = !audio || ['aac', 'mp3'].includes(audio.codec);
+  const threads = config.ffmpegThreads;
   const args = [
     '-nostdin', '-hide_banner', '-loglevel', 'error',
     '-progress', 'pipe:1', '-nostats', '-y',
+    // Decoder threads, before the input they apply to.
+    '-threads', String(threads),
     '-i', job.sourcePath,
     '-map', `0:${job.video.index}`,
   ];
@@ -28,6 +32,8 @@ function ffmpegArguments(job, outputPath) {
   } else {
     args.push('-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23', '-pix_fmt', 'yuv420p');
     if (needsScale) args.push('-vf', `scale=-2:${job.conversionOptions.resolution}`);
+    // Encoder threads.
+    args.push('-threads:v', String(threads));
   }
 
   if (audio) {
@@ -38,11 +44,13 @@ function ffmpegArguments(job, outputPath) {
     args.push(
       '-c:a', 'aac',
       '-b:a', '192k',
-      '-af', 'pan=stereo|FL < 1.0*FL + 0.707*FC + 0.707*BL|FR < 1.0*FR + 0.707*FC + 0.707*BR'
+      '-af', 'pan=stereo|FL < 1.0*FL + 0.707*FC + 0.707*BL|FR < 1.0*FR + 0.707*FC + 0.707*BR',
+      // Audio encoding is cheap, so it never needs more than one thread.
+      '-threads:a', '1',
     );
   }
 }
-  if (!copyVideo) args.push('-threads:v', '4');
+  args.push('-filter_threads', String(threads));
   args.push('-movflags', '+faststart', '-f', 'mp4', outputPath);
   return { args, copyVideo, copyAudio };
 }
@@ -58,6 +66,7 @@ export async function convertPreparedJob(job, runProcess) {
   job.progress = 45;
   await runProcess(job, 'ffmpeg', args, {
     timeoutMs: 6 * 60 * 60_000,
+    lowPriority: true,
     onLine: (line) => {
       const timeText = /^out_time=(\d+):(\d+):(\d+(?:\.\d+)?)/.exec(line);
       if (timeText && job.duration > 0) {
@@ -70,7 +79,7 @@ export async function convertPreparedJob(job, runProcess) {
   });
   if (job.status === 'cancelled') throw Object.assign(new Error('Conversion cancelled.'), { cancelled: true });
   const validation = await probeMediaFile(outputPath, {
-    onSpawn: (child) => { job.cancelCurrent = () => child.kill('SIGKILL'); },
+    onSpawn: (child) => { job.cancelCurrent = () => killProcessTree(child, 'SIGKILL'); },
   });
   job.cancelCurrent = null;
   if (job.status === 'cancelled') throw Object.assign(new Error('Conversion cancelled.'), { cancelled: true });

@@ -36,6 +36,28 @@ export default function VideoPlayer({
   const [playerMuted, setPlayerMuted] = useState(true);
   const [mutedForUrl, setMutedForUrl] = useState(url);
   const playingRef = useRef(false);
+  // The engine calls play() and pause() itself, and the browser reports those
+  // as play and pause events as well. The event can arrive after the room
+  // state has already changed, so it is matched against the engine's own
+  // call here. Reporting it as a user action would make the room start or
+  // stop playing on its own.
+  const programmaticPlayAtRef = useRef(0);
+  const programmaticPauseAtRef = useRef(0);
+  const markProgrammaticPlay = useCallback(() => {
+    programmaticPlayAtRef.current = Date.now();
+  }, []);
+  const markProgrammaticPause = useCallback(() => {
+    programmaticPauseAtRef.current = Date.now();
+  }, []);
+  const consumeProgrammaticEvent = useCallback((kind) => {
+    const ref = kind === 'play' ? programmaticPlayAtRef : programmaticPauseAtRef;
+    const markedAt = ref.current;
+    if (!markedAt) return false;
+    ref.current = 0;
+    // The engine's call never produced an event (blocked autoplay), so the
+    // mark is stale and must not swallow a later user action.
+    return Date.now() - markedAt < 2000;
+  }, []);
   // True while a seek we performed ourselves is in flight, so the resulting
   // seek event is recognised as an echo rather than a user scrub.
   const programmaticSeekRef = useRef(null);
@@ -95,12 +117,19 @@ export default function VideoPlayer({
     if (!player) return;
     if (typeof player.playVideo === 'function') {
       // YouTube (YT.Player)
-      if (playing) player.playVideo();
-      else if (typeof player.pauseVideo === 'function') player.pauseVideo();
+      if (playing) {
+        markProgrammaticPlay();
+        player.playVideo();
+      } else if (typeof player.pauseVideo === 'function') {
+        markProgrammaticPause();
+        player.pauseVideo();
+      }
       return;
     }
     if (typeof player.setCurrentTime === 'function' && typeof player.play === 'function') {
       // Vimeo (Player SDK)
+      if (playing) markProgrammaticPlay();
+      else markProgrammaticPause();
       const result = playing ? player.play() : player.pause();
       if (result?.catch) result.catch(() => setAutoplayBlocked(true));
       return;
@@ -108,19 +137,22 @@ export default function VideoPlayer({
     if (typeof player.play === 'function') {
       // HTML5 <video>/<audio>
       if (playing && player.paused) {
+        markProgrammaticPlay();
         const playResult = player.play();
         if (playResult?.catch) {
           playResult.catch(() => {
             try { player.muted = true; } catch { /* ignore */ }
+            markProgrammaticPlay();
             const mutedResult = player.play();
             if (mutedResult?.catch) mutedResult.catch(() => setAutoplayBlocked(true));
           });
         }
       } else if (!playing && !player.paused) {
+        markProgrammaticPause();
         player.pause();
       }
     }
-  }, [getPlayer, playing]);
+  }, [getPlayer, markProgrammaticPause, markProgrammaticPlay, playing]);
 
   // The player reports every seek through one event, whether the user dragged
   // the scrub bar or the sync engine moved it. Record the position we seek to
@@ -280,8 +312,14 @@ export default function VideoPlayer({
                     event.currentTarget.muted = false;
                     setPlayerMuted(false);
                   }
+                  // The engine started the player itself.
+                  if (consumeProgrammaticEvent('play')) return;
+                  // The room already believes the video is playing, so there is
+                  // nothing to change.
+                  if (playing) return;
                   // A viewer without control must follow the host's play state.
-                  if (!canControl && !playing) {
+                  if (!canControl) {
+                    markProgrammaticPause();
                     event.currentTarget.pause();
                     return;
                   }
@@ -291,6 +329,8 @@ export default function VideoPlayer({
                 }}
                 onPause={() => {
                   playingRef.current = false;
+                  // The engine stopped the player itself.
+                  if (consumeProgrammaticEvent('pause')) return;
                   // A viewer without control stays on the room's play state.
                   if (!canControl) {
                     reassertRoomState();
@@ -334,8 +374,14 @@ export default function VideoPlayer({
                 playingRef.current = true;
                 // Restore audio once the page has a user gesture.
                 if (activated) setPlayerMuted(false);
+                // The engine started the player itself.
+                if (consumeProgrammaticEvent('play')) return;
+                // The room already believes the video is playing, so there is
+                // nothing to change.
+                if (playing) return;
                 // A viewer without control must follow the host's play state.
-                if (!canControl && !playing) {
+                if (!canControl) {
+                  markProgrammaticPause();
                   const player = getPlayer();
                   if (player && typeof player.pauseVideo === 'function') player.pauseVideo();
                   else if (player && typeof player.pause === 'function') player.pause();
@@ -346,6 +392,8 @@ export default function VideoPlayer({
               }}
               onPause={() => {
                 playingRef.current = false;
+                // The engine stopped the player itself.
+                if (consumeProgrammaticEvent('pause')) return;
                 // A viewer without control stays on the room's play state.
                 if (!canControl) {
                   reassertRoomState();

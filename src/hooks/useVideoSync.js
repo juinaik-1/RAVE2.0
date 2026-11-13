@@ -126,6 +126,81 @@ export function useVideoSync({
     return true;
   }, []);
 
+  // The room's source is kept in the tab, so a refresh does not lose the
+  // video. It is a convenience only: the room itself always wins, so a room
+  // that moved on to another video is never overridden by a stale copy.
+  const sourceStorageKey = `Nook-room-source:${roomId}`;
+
+  const saveRoomSource = useCallback(() => {
+    if (!roomId) return;
+    const current = currentRef.current;
+    if (!current.streamId && !current.videoUrl) return;
+    try {
+      window.sessionStorage.setItem(sourceStorageKey, JSON.stringify({
+        streamId: current.streamId,
+        videoUrl: current.videoUrl,
+        name: current.streamName,
+        time: current.time,
+        playing: current.playing,
+      }));
+    } catch {
+      /* the tab storage is a convenience, not a requirement */
+    }
+  }, [roomId, sourceStorageKey]);
+
+  const readSavedSource = useCallback(() => {
+    if (!roomId) return null;
+    try {
+      const raw = window.sessionStorage.getItem(sourceStorageKey);
+      if (!raw) return null;
+      const saved = JSON.parse(raw);
+      return saved && (saved.streamId || saved.videoUrl) ? saved : null;
+    } catch {
+      return null;
+    }
+  }, [roomId, sourceStorageKey]);
+
+  // Remember the source and the position as the video plays.
+  useEffect(() => {
+    if (!roomId) return undefined;
+    saveRoomSource();
+    const timer = window.setInterval(saveRoomSource, 5000);
+    return () => window.clearInterval(timer);
+  }, [roomId, saveRoomSource, streamId, videoUrl]);
+
+  // Restore the source after a refresh. The room is asked for its state
+  // first, and the saved copy is only used when the room has none to give,
+  // which is what happens when the host refreshes too.
+  useEffect(() => {
+    if (!roomId) return undefined;
+    let cancelled = false;
+    const timer = window.setTimeout(async () => {
+      if (cancelled) return;
+      const current = currentRef.current;
+      if (current.streamId || current.videoUrl) return;
+      const saved = readSavedSource();
+      if (!saved) return;
+      const loaded = saved.streamId
+        ? await applyStream(saved.streamId, saved.name)
+        : applyUrl(saved.videoUrl);
+      if (cancelled || !loaded) return;
+      if (Number.isFinite(Number(saved.time))) {
+        currentRef.current = { ...currentRef.current, time: Number(saved.time) };
+        setTime(Number(saved.time));
+        setRoomTime(Number(saved.time));
+      }
+      if (typeof saved.playing === 'boolean') {
+        currentRef.current = { ...currentRef.current, playing: saved.playing };
+        setPlaying(saved.playing);
+      }
+      setSyncNonce((value) => value + 1);
+    }, 1500);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [roomId, readSavedSource, applyStream, applyUrl]);
+
   useEffect(() => {
     if (!channel || !roomId) return undefined;
 
@@ -373,6 +448,7 @@ export function useVideoSync({
 
   const handlePlayPause = useCallback((nextPlaying) => {
     if (!canControl) return;
+    if (applyingRemoteRef.current) return;
     const target = Boolean(nextPlaying);
     const current = currentRef.current;
     // Ignore echoes from the local player after a remote update was applied.
@@ -383,9 +459,6 @@ export function useVideoSync({
     broadcastState({ playing: target });
   }, [broadcastState, canControl]);
 
-  // A seek can arrive two ways: the user dragged the scrub bar, or the local
-  // player echoed back a seek we applied from a remote update. Only the latter
-  // must be filtered, so the caller tells us which it is.
   const handleSeek = useCallback((nextTime, options = {}) => {
     if (!canControl || applyingRemoteRef.current) return;
     const seconds = Number(nextTime || 0);

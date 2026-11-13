@@ -26,6 +26,9 @@ export default function Convert() {
       : null;
   const [sourceType, setSourceType] = useState(initialSource ? 'drive' : 'url');
   const [source, setSource] = useState(initialSource);
+  // The source is still known when a conversion fails, so it can be started
+  // again without picking the file a second time.
+  const retrySource = initialSource || (source?.streamId ? source : null);
   const [url, setUrl] = useState('');
   const [audioTrack, setAudioTrack] = useState('');
   const [resolution, setResolution] = useState('original');
@@ -368,7 +371,19 @@ export default function Convert() {
         {job?.status === 'failed' || error ? (
           <div role="alert" className="mt-5 flex items-start gap-2 rounded-md border border-red-200 bg-red-50 p-3 text-sm text-red-700 dark:border-red-900/50 dark:bg-red-950/30 dark:text-red-300">
             <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
-            {error || job.error || job.message}
+            <div className="min-w-0 flex-1">
+              <p className="break-words">{error || job.error || job.message}</p>
+              {retrySource ? (
+                <Button
+                  size="sm"
+                  variant="secondary"
+                  className="mt-2"
+                  onClick={() => void start(retrySource, { autoStart: true, resolution: 'original' })}
+                >
+                  Start again
+                </Button>
+              ) : null}
+            </div>
           </div>
         ) : null}
         {job?.status === 'cancelled' ? (

@@ -1,4 +1,4 @@
-import { useCallback, useState } from 'react';
+﻿import { useCallback, useState } from 'react';
 import { api } from '../utils/api';
 
 let pickerReady;
@@ -22,11 +22,13 @@ export function useDrivePicker(onPicked) {
 
   const connectDrive = useCallback(async () => {
     setBusy(true);
-    setStatus('Connecting to Google Drive…');
+    setStatus('Connecting to Google Driveâ€¦');
     setError('');
     try {
       const { authUrl } = await api.post('/api/drive/connect', {
-        returnTo: `${window.location.pathname}${window.location.search}`,
+        // The full address, not just the path: the callback has to send the
+        // browser back to the device that started the connection.
+        returnTo: `${window.location.origin}${window.location.pathname}${window.location.search}`,
       });
       window.location.assign(authUrl);
     } catch (requestError) {
@@ -38,7 +40,7 @@ export function useDrivePicker(onPicked) {
 
   const openPicker = useCallback(async () => {
     setBusy(true);
-    setStatus('Opening Google Drive picker…');
+    setStatus('Opening Google Drive pickerâ€¦');
     setError('');
     try {
       const [tokenResult] = await Promise.all([

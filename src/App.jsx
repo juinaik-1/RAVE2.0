@@ -1,4 +1,4 @@
-import { Navigate, Route, Routes } from 'react-router-dom';
+import { Navigate, Route, Routes, useLocation } from 'react-router-dom';
 import Home from './pages/Home';
 import Room from './pages/Room';
 import SignIn from './pages/SignIn';
@@ -8,10 +8,13 @@ import { AuthProvider, useAuth } from './context/AuthContext';
 
 function ProtectedRoute({ children }) {
   const { user, loading } = useAuth();
+  const location = useLocation();
   if (loading) {
     return <main className="flex min-h-screen items-center justify-center bg-zinc-50 dark:bg-zinc-950">Loading…</main>;
   }
-  return user ? children : <Navigate to="/signin" replace />;
+  // Remember where the person was headed, so signing in takes them back
+  // there instead of to the home page.
+  return user ? children : <Navigate to="/signin" replace state={{ from: location }} />;
 }
 
 export default function App() {

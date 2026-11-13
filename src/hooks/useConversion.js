@@ -39,13 +39,23 @@ export function useConversion() {
     stopped.current = false;
     setError('');
     setJob(null);
-    try {
-      const created = await api.post('/api/jobs', { ...source, ...options });
-      setJob(created);
-      await poll(created.id);
-    } catch (requestError) {
-      setError(requestError.message || 'Unable to start conversion.');
-    }
+    const run = async (attempt) => {
+      try {
+        const created = await api.post('/api/jobs', { ...source, ...options });
+        setJob(created);
+        await poll(created.id);
+      } catch (requestError) {
+        // The job disappeared, which happens when the server restarted while
+        // the conversion was running. Start it again once instead of leaving
+        // the tab on a dead end.
+        if (requestError.status === 404 && attempt === 0) {
+          await run(attempt + 1);
+          return;
+        }
+        setError(requestError.message || 'Unable to start conversion.');
+      }
+    };
+    await run(0);
   }, [poll]);
 
   const convert = useCallback(async (jobId, options) => {

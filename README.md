@@ -80,6 +80,24 @@ yt-dlp --version
 
 Run the API as a dedicated service account. Keep `DATA_DIR` and `DOWNLOAD_DIR` on a private, persistent filesystem with adequate free space; grant write access only to that account. Set `NODE_ENV=production`, `PUBLIC_BASE_URL=https://api.your-domain.example`, exact `FRONTEND_ORIGINS`, Google credentials, and strong generated secrets. Restart the service after updating `yt-dlp`, `ffmpeg`, or environment values. Conversion accepts only content you own or may legally share.
 
+### Keeping conversions off the API's CPU
+The API proxies video streams while a conversion runs in the same process, so ffmpeg is never allowed to take every core. Two limits are applied automatically:
+
+- **Thread caps.** ffmpeg and ffprobe run with `-threads`, `-threads:v`, `-threads:a` and `-filter_threads` limits. `FFMPEG_THREADS` (default `2`, allowed range `1`–`8`) sets the value. Raise it on a machine that is dedicated to conversions; lower it on a small VM.
+- **Low scheduler priority.** On Linux the media tools are started through `nice -n 15`, so the kernel gives the API the CPU first and leaves the leftovers to the conversion. The tool runs in its own process group, so cancelling a job still stops the real ffmpeg. `nice` is part of coreutils; when it is unavailable the tool runs at normal priority.
+
+Give the API service account a slightly higher CPU weight than the conversion if the machine is shared, and keep at least one core free for the stream proxy.
+
+### Disk space and cleanup
+
+A conversion needs room for the downloaded source and the output at the same time, so the API refuses new work before it fills the disk:
+
+- **Free space guard.** `POST /api/jobs` checks the free space on the `DOWNLOAD_DIR` filesystem with `fs.statfs` and refuses the job when less than `MIN_FREE_DISK_GB` (default `5`) is left. The user is told that conversions are paused, not that the request failed.
+- **Leftover files.** A conversion that is cancelled, or a server that stops mid job, leaves its source and partial output behind. Those files are removed as soon as the job ends, and anything still there afterwards is removed by a sweep that runs on startup and once an hour. A file that a live stream still serves is never removed.
+- **One lifetime.** `FILE_TTL_HOURS` (default `36`) decides when a converted video is deleted and when it disappears from the room's list — the countdown in the "Your recent conversions" panel shows the same time. The cleanup sweep follows the same number, so there is a single place to change it.
+
+Give `DOWNLOAD_DIR` its own filesystem with a quota, so a runaway download cannot take the API's disk with it. Watch the free space and the `Disk cleanup removed ...` log line.
+
 ### Caddy stream proxy
 
 Point the API domain at the VM. Caddy streams reverse-proxy responses; set a negative `flush_interval` on the stream route to disable response buffering and flush immediately:

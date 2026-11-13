@@ -201,6 +201,53 @@ export function getStream(streamId) {
   return records.get(streamId) || null;
 }
 
+// The files that live streams still serve. The cleanup must never remove
+// these, or a room that is watching would lose its video.
+export function listReferencedFilePaths() {
+  return [...records.values()]
+    .filter((record) => record.kind === 'file')
+    .map((record) => path.resolve(record.filePath));
+}
+
+// Drop the records whose file is already gone. A conversion that was
+// interrupted, or a stream that was deleted, leaves a record behind that
+// points at nothing.
+export function pruneMissingStreamRecords() {
+  let changed = false;
+  for (const [streamId, record] of records) {
+    if (record.kind !== 'file' || !record.filePath) continue;
+    if (fs.existsSync(record.filePath)) continue;
+    records.delete(streamId);
+    changed = true;
+  }
+  if (changed) persistRecords();
+  return changed;
+}
+
+// The converted videos this account still has on disk.
+//
+// The backend owns this list. The converted files live on this machine and
+// the cleanup job deletes them when they expire, so the filesystem is the
+// only source of truth: a record whose file is gone is not offered, and a
+// file the cleanup has not reached yet is.
+export function getUserActiveStreams(userId) {
+  const now = Date.now();
+  const active = [];
+  for (const record of records.values()) {
+    if (record.ownerUserId !== userId) continue;
+    if (record.kind !== 'file') continue;
+    if (!record.expiresAt || record.expiresAt <= now) continue;
+    if (!record.filePath || !fs.existsSync(record.filePath)) continue;
+    active.push({
+      streamId: record.streamId,
+      name: record.name,
+      expiresAt: record.expiresAt,
+    });
+  }
+  // The newest conversion expires last, so it is offered first.
+  return active.sort((a, b) => b.expiresAt - a.expiresAt);
+}
+
 export function getStreamAccess(streamId) {
   const record = getStream(streamId);
   if (!record || record.expiresAt <= Date.now()) return null;

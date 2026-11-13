@@ -66,14 +66,41 @@ export async function resolveTargetAndBlockPrivateHosts(value) {
   return { parsed, resolvedIps: addresses.map(({ address }) => address) };
 }
 
+// Free bytes on the filesystem that holds the given directory.
+export function getFreeDiskBytes(directoryPath) {
+  const stats = fs.statfsSync(directoryPath);
+  return stats.bavail * stats.bsize;
+}
+
+// Refuse to take on work the disk cannot hold. A conversion needs room for
+// the downloaded source and the output at the same time, so a nearly full
+// disk has to be reported before a job is accepted, not after it filled the
+// disk.
+export function assertMinimumFreeSpace(minimumBytes, directoryPath) {
+  fs.mkdirSync(directoryPath, { recursive: true });
+  const availableBytes = getFreeDiskBytes(directoryPath);
+  if (availableBytes < minimumBytes) {
+    const error = new Error(
+      'The server is running low on disk space, so new conversions are paused. Try again later.',
+    );
+    error.status = 507;
+    error.exposeToUser = true;
+    throw error;
+  }
+  return availableBytes;
+}
+
 export function ensureFreeDiskSpace(requiredBytes, directoryPath) {
   fs.mkdirSync(directoryPath, { recursive: true });
-  const stats = fs.statfsSync(directoryPath);
-  const availableBytes = stats.bavail * stats.bsize;
+  const availableBytes = getFreeDiskBytes(directoryPath);
   const minimumRequired = Number(requiredBytes || 0) + 512 * 1024 * 1024;
   if (availableBytes < minimumRequired) {
-    throw new Error('Not enough free disk space to download and convert this file.');
+    const error = new Error('Not enough free disk space to download and convert this file.');
+    error.status = 507;
+    error.exposeToUser = true;
+    throw error;
   }
+  return availableBytes;
 }
 
 export function isValidJobId(value) {

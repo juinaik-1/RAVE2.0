@@ -7,9 +7,15 @@ import { config } from './config.js';
 import { getDriveMediaResponse } from './driveOAuth.js';
 import { probeMediaFile } from './probe.js';
 import { convertPreparedJob } from './convert.js';
+import {
+  killProcessTree,
+  lowPrioritySpawnOptions,
+  prepareLowPriority,
+} from './processPriority.js';
 import { deleteStream, getStream } from './streams.js';
 import {
   createJobId,
+  assertMinimumFreeSpace,
   ensureFreeDiskSpace,
   resolveTargetAndBlockPrivateHosts,
   validateUrl,
@@ -20,6 +26,75 @@ const queue = [];
 const children = new Map();
 let activeJobId = null;
 
+// The jobs are kept on disk so a restart does not lose them. A conversion tab
+// polls its job for the whole conversion, so a job that vanished on a restart
+// left the tab stuck on "Job not found".
+const jobPath = path.join(config.dataDir, 'jobs.json');
+
+function persistableJob(job) {
+  return {
+    id: job.id,
+    ownerUserId: job.ownerUserId,
+    source: job.source,
+    status: job.status,
+    message: job.message,
+    progress: job.progress,
+    error: job.error,
+    audioTracks: job.audioTracks,
+    duration: job.duration,
+    video: job.video,
+    sourceName: job.sourceName,
+    outputStreamId: job.outputStreamId,
+    conversionOptions: job.conversionOptions,
+    requestedOptions: job.requestedOptions,
+    createdAt: job.createdAt,
+    completedAt: job.completedAt,
+  };
+}
+
+function persistJobs() {
+  try {
+    fs.mkdirSync(config.dataDir, { recursive: true, mode: 0o700 });
+    const temporary = `${jobPath}.${process.pid}.tmp`;
+    fs.writeFileSync(temporary, JSON.stringify([...jobs.values()].map(persistableJob)), { mode: 0o600 });
+    fs.renameSync(temporary, jobPath);
+  } catch (error) {
+    console.error('Unable to save the conversion jobs.', error);
+  }
+}
+
+function loadJobs() {
+  try {
+    const saved = JSON.parse(fs.readFileSync(jobPath, 'utf8'));
+    if (!Array.isArray(saved)) return;
+    for (const record of saved) {
+      if (!record || typeof record.id !== 'string' || !record.ownerUserId) continue;
+      // A conversion that was running when the server stopped cannot still be
+      // running, because its process is gone. Say so instead of leaving the
+      // conversion tab waiting for a job that will never move.
+      const wasRunning = ['queued', 'downloading', 'analyzing', 'converting'].includes(record.status);
+      jobs.set(record.id, {
+        ...record,
+        sourcePath: null,
+        outputFilePath: null,
+        cancelCurrent: null,
+        status: wasRunning ? 'failed' : record.status,
+        message: wasRunning ? 'The server restarted during this conversion' : record.message,
+        error: wasRunning
+          ? 'The server restarted during this conversion. Start it again.'
+          : (record.error || ''),
+        completedAt: wasRunning ? Date.now() : record.completedAt,
+      });
+    }
+    // A job that was running is now failed, so the file must say so too.
+    persistJobs();
+  } catch (error) {
+    if (error.code !== 'ENOENT') console.error('Unable to read the conversion jobs.', error);
+  }
+}
+
+loadJobs();
+
 function setFailure(job, error) {
   if (job.status === 'cancelled') return;
   job.status = 'failed';
@@ -27,6 +102,7 @@ function setFailure(job, error) {
   job.message = error.message || 'Conversion failed.';
   job.error = job.message;
   job.completedAt = Date.now();
+  persistJobs();
 }
 
 function removeJobFiles(jobId) {
@@ -58,22 +134,40 @@ function removeJobFiles(jobId) {
 
 function killChild(child) {
   if (!child?.pid) return;
-  if (process.platform === 'win32') {
-    const killer = spawn('taskkill', ['/pid', String(child.pid), '/T', '/F'], {
-      windowsHide: true,
-      stdio: 'ignore',
-    });
-    killer.unref();
-  } else {
-    child.kill('SIGTERM');
-    const timer = setTimeout(() => child.kill('SIGKILL'), 5000);
-    timer.unref?.();
+
+  killProcessTree(child, 'SIGTERM');
+  if (process.platform === 'win32') return;
+  const timer = setTimeout(() => killProcessTree(child, 'SIGKILL'), 5000);
+  timer.unref?.();
+}
+
+function stopRunningTools() {
+  for (const child of children.values()) {
+    try {
+      killProcessTree(child, 'SIGKILL');
+    } catch {
+      /* ignore */
+    }
   }
 }
 
-function runProcess(job, command, args, { timeoutMs, onLine } = {}) {
+process.on('exit', stopRunningTools);
+for (const signal of ['SIGINT', 'SIGTERM']) {
+  process.on(signal, () => {
+    stopRunningTools();
+    process.exit(0);
+  });
+}
+
+function spawnProcess(job, command, args, { timeoutMs, onLine, lowPriority }) {
+  const prepared = lowPriority
+    ? prepareLowPriority(command, args)
+    : { command, args, wrapped: false };
   return new Promise((resolve, reject) => {
-    const child = spawn(command, args, { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
+    const child = spawn(prepared.command, prepared.args, {
+      ...lowPrioritySpawnOptions(prepared.wrapped),
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
     children.set(job.id, child);
     let stdoutRemainder = '';
     let stderrRemainder = '';
@@ -116,9 +210,17 @@ function runProcess(job, command, args, { timeoutMs, onLine } = {}) {
     };
     child.stdout.on('data', (chunk) => parseChunk(chunk, 'stdout'));
     child.stderr.on('data', (chunk) => parseChunk(chunk, 'stderr'));
-    child.once('error', (error) => finish(error.code === 'ENOENT'
-      ? new Error(`${command} is not installed or is not available on PATH.`)
-      : error));
+    child.once('error', (error) => {
+      if (error.code === 'ENOENT') {
+        // The code is kept so a missing `nice` wrapper can be retried without
+        // it instead of failing the conversion.
+        const notFound = new Error(`${command} is not installed or is not available on PATH.`);
+        notFound.code = 'ENOENT';
+        finish(notFound);
+        return;
+      }
+      finish(error);
+    });
     child.once('close', (code) => {
       if (stdoutRemainder) onLine(stdoutRemainder);
       if (stderrRemainder) onLine(stderrRemainder);
@@ -161,6 +263,17 @@ function runProcess(job, command, args, { timeoutMs, onLine } = {}) {
     }, 15_000);
     job.cancelCurrent = () => killChild(child);
   });
+}
+async function runProcess(job, command, args, { timeoutMs, onLine, lowPriority = false } = {}) {
+  try {
+    await spawnProcess(job, command, args, { timeoutMs, onLine, lowPriority });
+  } catch (error) {
+    if (error?.code === 'ENOENT' && lowPriority) {
+      await spawnProcess(job, command, args, { timeoutMs, onLine, lowPriority: false });
+      return;
+    }
+    throw error;
+  }
 }
 
 function currentSourceFiles(jobId) {
@@ -354,6 +467,7 @@ async function prepareSource(job) {
   job.status = 'awaiting_options';
   job.message = 'Choose an audio track and resolution to continue';
   job.progress = 40;
+  persistJobs();
 }
 
 function enqueue(job) {
@@ -376,12 +490,21 @@ function processQueue() {
     // supplied up front) converts straight away instead of waiting for the
     // interactive options step.
     if (job.conversionOptions) await convertPreparedJob(job, runProcess);
+    persistJobs();
   })().catch((error) => {
     if (error.cancelled || job.status === 'cancelled') {
       job.status = 'cancelled';
       job.message = 'Conversion cancelled';
       job.error = '';
       job.completedAt ||= Date.now();
+      // A cancelled conversion leaves its downloaded source and its partial
+      // output on disk. Closing the tab is the same thing: the files are
+      // removed now instead of waiting for the disk cleanup.
+      if (job.sourcePath) fs.rmSync(job.sourcePath, { force: true });
+      if (job.outputFilePath && !job.outputStreamId) fs.rmSync(job.outputFilePath, { force: true });
+      removeJobFiles(job.id);
+      job.sourcePath = null;
+      persistJobs();
       return;
     }
     setFailure(job, error);
@@ -404,6 +527,10 @@ function checkQueueCapacity() {
 }
 
 export async function createJob(ownerUserId, source, options = {}) {
+  // Refuse new work before anything is downloaded. The disk has to hold the
+  // source and the output at the same time, so a nearly full disk must be
+  // reported here instead of failing halfway through the conversion.
+  assertMinimumFreeSpace(config.minFreeDiskBytes, config.downloadDir);
   if (!source || (typeof source.streamId !== 'string' && typeof source.url !== 'string')) {
     const error = new Error('Choose a registered Drive video or provide a source URL.');
     error.status = 400;
@@ -469,6 +596,7 @@ export async function createJob(ownerUserId, source, options = {}) {
     cancelCurrent: null,
   };
   jobs.set(id, job);
+  persistJobs();
   enqueue(job);
   return serializeJob(job);
 }
@@ -503,6 +631,7 @@ export function requestJobConversion(id, ownerUserId, options) {
   job.conversionOptions = { audioTrack, resolution: String(resolution) };
   job.status = 'queued';
   job.message = 'Queued for conversion';
+  persistJobs();
   enqueue(job);
   return serializeJob(job);
 }
@@ -530,6 +659,7 @@ export function cancelJob(id, ownerUserId) {
   if (job.outputFilePath && !job.outputStreamId) fs.rmSync(job.outputFilePath, { force: true });
   removeJobFiles(id);
   job.sourcePath = null;
+  persistJobs();
   if (activeJobId !== id) processQueue();
   return serializeJob(job);
 }
@@ -551,6 +681,7 @@ export function serializeJob(job) {
 }
 
 export function cleanupExpiredJobs(now = Date.now()) {
+  let changed = false;
   for (const [id, job] of jobs) {
     const expiredAt = job.completedAt || job.createdAt;
     if (now - expiredAt <= config.fileTtlMs || activeJobId === id || queue.includes(id)) continue;
@@ -558,5 +689,15 @@ export function cleanupExpiredJobs(now = Date.now()) {
     if (job.outputStreamId) deleteStream(job.outputStreamId);
     removeJobFiles(id);
     jobs.delete(id);
+    changed = true;
   }
+  if (changed) persistJobs();
+}
+
+// The jobs that are queued or running. The disk cleanup must leave their
+// files alone, because they are still being written.
+export function listActiveJobIds() {
+  const ids = new Set(queue);
+  if (activeJobId) ids.add(activeJobId);
+  return [...ids];
 }

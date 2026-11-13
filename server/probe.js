@@ -4,6 +4,7 @@ import { spawn } from 'node:child_process';
 import crypto from 'node:crypto';
 import { Readable } from 'node:stream';
 import { getDriveMediaResponse } from './driveOAuth.js';
+import { killProcessTree, lowPrioritySpawnOptions, prepareLowPriority } from './processPriority.js';
 
 // ffprobe only needs the container metadata, which lives near the start of the
 // file. Capping the range keeps a probe from downloading the whole source.
@@ -50,7 +51,13 @@ function runFfprobe(input, onSpawn, timeoutMs = 120_000) {
       '-of', 'json',
       input,
     ];
-    const child = spawn('ffprobe', args, { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
+    // Probing decodes part of the file, so it runs at the lowest scheduler
+    // priority for the same reason the conversion does.
+    const prepared = prepareLowPriority('ffprobe', args);
+    const child = spawn(prepared.command, prepared.args, {
+      ...lowPrioritySpawnOptions(prepared.wrapped),
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
     onSpawn?.(child);
     let stdout = '';
     let stderr = '';
@@ -65,11 +72,11 @@ function runFfprobe(input, onSpawn, timeoutMs = 120_000) {
     };
     const timer = setTimeout(() => {
       timedOut = true;
-      child.kill('SIGKILL');
+      killProcessTree(child, 'SIGKILL');
     }, timeoutMs);
     child.stdout.on('data', (chunk) => {
       stdout += chunk;
-      if (stdout.length > 2 * 1024 * 1024) child.kill('SIGKILL');
+      if (stdout.length > 2 * 1024 * 1024) killProcessTree(child, 'SIGKILL');
     });
     child.stderr.on('data', (chunk) => {
       stderr += chunk;

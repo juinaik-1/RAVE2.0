@@ -54,3 +54,9 @@ export const api = {
   post: (path, body) => apiFetch(path, { method: 'POST', body: JSON.stringify(body ?? {}) }),
   delete: (path) => apiFetch(path, { method: 'DELETE' }),
 };
+
+// The converted videos this account still has on the server. The server owns
+// the list, so no database is involved.
+export function fetchMyStreams() {
+  return apiFetch('/api/streams/mine');
+}

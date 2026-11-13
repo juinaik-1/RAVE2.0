@@ -34,6 +34,34 @@ function parsePort(value) {
   return port;
 }
 
+function parseFfmpegThreads(value) {
+  const threads = Number(value || 2);
+  if (!Number.isInteger(threads) || threads < 1 || threads > 8) {
+    throw new Error('FFMPEG_THREADS must be an integer between 1 and 8.');
+  }
+  return threads;
+}
+
+// The free space the disk must have left before a new conversion is accepted.
+function parseFreeDiskGb(value) {
+  const gigabytes = Number(value || 5);
+  if (!Number.isFinite(gigabytes) || gigabytes <= 0) {
+    throw new Error('MIN_FREE_DISK_GB must be a positive number.');
+  }
+  return gigabytes * 1024 ** 3;
+}
+
+// How long a leftover file is kept before the cleanup removes it. A file that
+// is still referenced by a live stream is never removed. It follows the file
+// lifetime so the two can never disagree.
+function parseOrphanFileTtlHours(value, fallbackHours) {
+  const hours = Number(value ?? fallbackHours);
+  if (!Number.isFinite(hours) || hours <= 0) {
+    throw new Error('ORPHAN_FILE_TTL_HOURS must be a positive number.');
+  }
+  return hours * 60 * 60 * 1000;
+}
+
 function resolveDirectory(value, fallback) {
   const directory = value || fallback;
   return path.isAbsolute(directory) ? directory : path.resolve(projectDir, directory);
@@ -118,6 +146,15 @@ export const config = Object.freeze({
   maxSourceBytes: Number(process.env.MAX_SOURCE_GB || 5) * 1024 ** 3,
   maxQueueSize: Number(process.env.MAX_QUEUE_SIZE || 3),
   fileTtlMs: Number(process.env.FILE_TTL_HOURS || 24) * 60 * 60 * 1000,
+  ffmpegThreads: parseFfmpegThreads(process.env.FFMPEG_THREADS),
+  // Free space the disk must have left before a conversion is accepted.
+  minFreeDiskBytes: parseFreeDiskGb(process.env.MIN_FREE_DISK_GB),
+  // How long a leftover file is kept before the cleanup removes it. It follows
+  // the file lifetime, so one number decides when a converted video goes.
+  orphanFileTtlMs: parseOrphanFileTtlHours(
+    process.env.ORPHAN_FILE_TTL_HOURS,
+    Number(process.env.FILE_TTL_HOURS || 24),
+  ),
 });
 
 if (!Number.isFinite(config.maxSourceBytes) || config.maxSourceBytes <= 0

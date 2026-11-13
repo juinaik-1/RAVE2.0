@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { Link, Navigate } from 'react-router-dom';
+import { Link, Navigate, useLocation } from 'react-router-dom';
 import { AlertCircle, Play, ShieldCheck } from 'lucide-react';
 import { Button, Panel } from '../components/ui';
 import { useAuth } from '../context/AuthContext';
@@ -8,9 +8,21 @@ import { useTheme } from '../hooks/useTheme';
 export default function SignIn() {
   const { user, loading, signIn } = useAuth();
   const { theme } = useTheme();
+  const location = useLocation();
   const buttonRef = useRef(null);
   const [error, setError] = useState('');
   const [pending, setPending] = useState(false);
+
+  // Where the person came from, so signing in takes them back to the room
+  // they were in instead of the home page.
+  const from = (() => {
+    const target = location.state?.from;
+    const path = typeof target === 'string'
+      ? target
+      : (target?.pathname ? `${target.pathname}${target.search || ''}${target.hash || ''}` : '');
+    if (!path || path.startsWith('/signin')) return '';
+    return path;
+  })();
 
   useEffect(() => {
     if (loading || user || !import.meta.env.VITE_GOOGLE_CLIENT_ID) return undefined;
@@ -58,7 +70,7 @@ export default function SignIn() {
   if (loading) {
     return <main className="flex min-h-screen items-center justify-center bg-zinc-50 dark:bg-zinc-950">Loading…</main>;
   }
-  if (user) return <Navigate to="/" replace />;
+  if (user) return <Navigate to={from || '/'} replace />;
 
   return (
     <main className="flex min-h-screen items-center justify-center bg-zinc-50 px-4 py-10 dark:bg-zinc-950">

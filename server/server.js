@@ -27,9 +27,11 @@ import {
   deleteStream,
   getStream,
   getStreamAccess,
+  getUserActiveStreams,
   registerDriveStream,
   serveStream,
 } from "./streams.js";
+import { startDiskCleanup } from "./cleanup.js";
 import { isValidJobId, isValidStreamId } from "./security.js";
 
 ensureDataDirectories();
@@ -40,9 +42,6 @@ app.disable("x-powered-by");
 app.use(helmet({ crossOriginResourcePolicy: { policy: "cross-origin" } }));
 app.use(cors({
   origin(origin, callback) {
-    // Allow requests from mobile browsers, local network, and configured origins.
-    // The dev server can be reached as localhost, 127.0.0.1 or a LAN address,
-    // so all of those loopback/LAN forms are accepted.
     if (!origin) return callback(null, true);
     const isLoopback = /^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$/i.test(origin);
     const isLanAddress = /^https?:\/\/(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)/i.test(origin);
@@ -191,6 +190,12 @@ app.post("/api/streams", async (req, res, next) => {
     return next(error);
   }
 });
+// The converted videos this account still has on the server. The list comes
+// from the server's own registry and the files on disk, so it needs no
+// database.
+app.get("/api/streams/mine", (req, res) =>
+  res.json(getUserActiveStreams(req.user.id)),
+);
 app.post("/api/streams/:streamId/access", (req, res) => {
   if (!isValidStreamId(req.params.streamId))
     return res.status(400).json({ error: "Invalid stream ID." });
@@ -299,6 +304,9 @@ const cleanupTimer = setInterval(() => {
   }
 }, 10 * 60_000);
 cleanupTimer.unref?.();
+// Remove the files a conversion left behind. Runs on startup and then every
+// hour, so a cancelled or interrupted conversion cannot fill the disk.
+startDiskCleanup();
 cleanupExpiredJobs();
 deleteExpiredStreams();
 

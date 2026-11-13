@@ -12,6 +12,7 @@ import {
 } from 'lucide-react';
 import Chat from '../components/Chat';
 import DriveSource from '../components/DriveSource';
+import RecentConversions from '../components/RecentConversions';
 import UserList from '../components/UserList';
 import VideoPlayer from '../components/VideoPlayer';
 import VoicePanel from '../components/VoicePanel';
@@ -187,6 +188,18 @@ export default function Room() {
     });
   };
 
+  // Play one of the account's recent conversions in the room. It uses the
+  // same handoff as a finished conversion, so every participant switches to
+  // it and the host decides when it starts.
+  const playRecentConversion = (stream) => {
+    if (!stream?.streamId) return;
+    void video.shareConvertedVideo(
+      { streamId: stream.streamId, name: stream.name },
+      { autoplay: canControl },
+    );
+    setReadyVideo(stream.name || 'Converted video');
+  };
+
   useEffect(() => {
     const sharedStream = location.state?.streamId;
     if (sharedStream) {
@@ -321,7 +334,7 @@ export default function Room() {
                 Sign out
               </Button>
             ) : (
-              <Button variant="ghost" size="sm" onClick={() => navigate('/signin')} aria-label="Sign in">
+              <Button variant="ghost" size="sm" onClick={() => navigate('/signin', { state: { from: `/room/${roomKey}` } })} aria-label="Sign in">
                 Sign in
               </Button>
             )}
@@ -357,10 +370,13 @@ export default function Room() {
             />
 
             {user ? (
-              <DriveSource
-                onLoadStream={video.loadStream}
-                onConvert={openConverter}
-              />
+              <>
+                <DriveSource
+                  onLoadStream={video.loadStream}
+                  onConvert={openConverter}
+                />
+                <RecentConversions onPlay={playRecentConversion} />
+              </>
             ) : (
               <p className="rounded-md border border-zinc-200/80 bg-white px-3 py-2 text-xs text-zinc-600 dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-400">
                 Guest mode: you can watch, chat, and join voice. Sign in to use Drive or convert videos.
