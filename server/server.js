@@ -149,7 +149,10 @@ app.get("/api/auth/google/callback", async (req, res) => {
       req.query.state,
       req.query.code,
     );
-    const target = new URL(user.returnTo, frontend);
+    const origin = user.origin && config.frontendOrigins.includes(user.origin)
+      ? user.origin
+      : frontend;
+    const target = new URL(user.returnTo, origin);
     target.searchParams.set("drive", "connected");
     target.searchParams.set("account", user.email);
     return res.redirect(target.toString());
@@ -163,8 +166,11 @@ app.get("/api/auth/google/callback", async (req, res) => {
 app.get("/api/auth/me", (req, res) => res.json({ user: req.user }));
 app.post("/api/drive/connect", (req, res, next) => {
   try {
+    const origin = typeof req.get("origin") === "string" && config.frontendOrigins.includes(req.get("origin"))
+      ? req.get("origin")
+      : "";
     return res.json({
-      authUrl: createDriveAuthorization(req.user, req.body?.returnTo || "/"),
+      authUrl: createDriveAuthorization(req.user, req.body?.returnTo || "/", origin),
     });
   } catch (error) {
     return next(error);

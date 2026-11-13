@@ -24,7 +24,7 @@ function pruneStates() {
   }
 }
 
-export function createDriveAuthorization(user, returnTo = '/') {
+export function createDriveAuthorization(user, returnTo = '/', origin = '') {
   pruneStates();
   if (typeof returnTo !== 'string' || !returnTo.startsWith('/') || returnTo.startsWith('//')) {
     const error = new Error('Invalid return path.');
@@ -34,7 +34,7 @@ export function createDriveAuthorization(user, returnTo = '/') {
   const state = crypto.randomBytes(32).toString('base64url');
   const codeVerifier = crypto.randomBytes(48).toString('base64url');
   const codeChallenge = crypto.createHash('sha256').update(codeVerifier).digest('base64url');
-  pendingStates.set(state, { user, codeVerifier, returnTo, expiresAt: Date.now() + 10 * 60_000 });
+  pendingStates.set(state, { user, codeVerifier, returnTo, origin, expiresAt: Date.now() + 10 * 60_000 });
 
   const authUrl = newOAuthClient().generateAuthUrl({
     access_type: 'offline',
@@ -90,7 +90,7 @@ export async function completeDriveAuthorization(state, code) {
     grantedScopes,
   );
   accessTokens.delete(pending.user.id);
-  return { ...pending.user, returnTo: pending.returnTo };
+  return { ...pending.user, returnTo: pending.returnTo, origin: pending.origin };
 }
 
 function isInvalidGrant(error) {

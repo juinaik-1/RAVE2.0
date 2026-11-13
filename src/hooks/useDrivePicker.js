@@ -26,9 +26,7 @@ export function useDrivePicker(onPicked) {
     setError('');
     try {
       const { authUrl } = await api.post('/api/drive/connect', {
-        // The full address, not just the path: the callback has to send the
-        // browser back to the device that started the connection.
-        returnTo: `${window.location.origin}${window.location.pathname}${window.location.search}`,
+        returnTo: `${window.location.pathname}${window.location.search}`,
       });
       window.location.assign(authUrl);
     } catch (requestError) {
