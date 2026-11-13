@@ -43,12 +43,24 @@ function parseFfmpegThreads(value) {
 }
 
 // The free space the disk must have left before a new conversion is accepted.
+// This is a tripwire, not a reservation: the per job check still insists on
+// room for the source and the output together. One gigabyte keeps a small
+// hosted disk usable while still stopping a runaway download.
 function parseFreeDiskGb(value) {
-  const gigabytes = Number(value || 5);
+  const gigabytes = Number(value ?? 1);
   if (!Number.isFinite(gigabytes) || gigabytes <= 0) {
     throw new Error('MIN_FREE_DISK_GB must be a positive number.');
   }
   return gigabytes * 1024 ** 3;
+}
+
+// How many requests one client address may make per minute.
+function parseRateLimit(value, fallback) {
+  const limit = Number(value ?? fallback);
+  if (!Number.isInteger(limit) || limit < 1) {
+    throw new Error('The rate limits must be positive whole numbers.');
+  }
+  return limit;
 }
 
 // How long a leftover file is kept before the cleanup removes it. A file that
@@ -129,6 +141,14 @@ if (tokenEncryptionKey.length !== 32) {
   throw new Error('TOKEN_ENCRYPTION_KEY must encode exactly 32 bytes (base64 or 64 hex characters).');
 }
 
+// How long a converted video is kept and served, and how long a leftover file
+// is kept before the cleanup removes it. One number decides both, so they can
+// never disagree.
+const fileTtlHours = Number(process.env.FILE_TTL_HOURS || 36);
+if (!Number.isFinite(fileTtlHours) || fileTtlHours <= 0) {
+  throw new Error('FILE_TTL_HOURS must be a positive number.');
+}
+
 export const config = Object.freeze({
   port: parsePort(process.env.PORT),
   nodeEnv: process.env.NODE_ENV || 'development',
@@ -145,16 +165,23 @@ export const config = Object.freeze({
   downloadDir: resolveDirectory(process.env.DOWNLOAD_DIR, path.join(serverDir, 'downloads')),
   maxSourceBytes: Number(process.env.MAX_SOURCE_GB || 5) * 1024 ** 3,
   maxQueueSize: Number(process.env.MAX_QUEUE_SIZE || 3),
-  fileTtlMs: Number(process.env.FILE_TTL_HOURS || 24) * 60 * 60 * 1000,
+  fileTtlMs: fileTtlHours * 60 * 60 * 1000,
   ffmpegThreads: parseFfmpegThreads(process.env.FFMPEG_THREADS),
   // Free space the disk must have left before a conversion is accepted.
   minFreeDiskBytes: parseFreeDiskGb(process.env.MIN_FREE_DISK_GB),
   // How long a leftover file is kept before the cleanup removes it. It follows
   // the file lifetime, so one number decides when a converted video goes.
-  orphanFileTtlMs: parseOrphanFileTtlHours(
-    process.env.ORPHAN_FILE_TTL_HOURS,
-    Number(process.env.FILE_TTL_HOURS || 24),
-  ),
+  orphanFileTtlMs: parseOrphanFileTtlHours(process.env.ORPHAN_FILE_TTL_HOURS, fileTtlHours),
+  // Requests one client address may make per minute.
+  rateLimits: {
+    api: parseRateLimit(process.env.API_RATE_LIMIT_PER_MIN, 120),
+    auth: parseRateLimit(process.env.AUTH_RATE_LIMIT_PER_MIN, 20),
+    drive: parseRateLimit(process.env.DRIVE_RATE_LIMIT_PER_MIN, 30),
+    jobs: parseRateLimit(process.env.JOBS_RATE_LIMIT_PER_MIN, 20),
+    // The media route streams bytes, not API calls, so it gets its own and
+    // much larger budget.
+    media: parseRateLimit(process.env.MEDIA_RATE_LIMIT_PER_MIN, 600),
+  },
 });
 
 if (!Number.isFinite(config.maxSourceBytes) || config.maxSourceBytes <= 0

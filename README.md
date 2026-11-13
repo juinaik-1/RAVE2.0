@@ -92,11 +92,37 @@ Give the API service account a slightly higher CPU weight than the conversion if
 
 A conversion needs room for the downloaded source and the output at the same time, so the API refuses new work before it fills the disk:
 
-- **Free space guard.** `POST /api/jobs` checks the free space on the `DOWNLOAD_DIR` filesystem with `fs.statfs` and refuses the job when less than `MIN_FREE_DISK_GB` (default `5`) is left. The user is told that conversions are paused, not that the request failed.
+- **Free space guard.** `POST /api/jobs` checks the free space on the `DOWNLOAD_DIR` filesystem with `fs.statfs` and refuses the job when less than `MIN_FREE_DISK_GB` (default `1`) is left. The user is told that conversions are paused, not that the request failed. This is a tripwire, not a reservation: the per job check still insists on room for the source and the output together.
 - **Leftover files.** A conversion that is cancelled, or a server that stops mid job, leaves its source and partial output behind. Those files are removed as soon as the job ends, and anything still there afterwards is removed by a sweep that runs on startup and once an hour. A file that a live stream still serves is never removed.
 - **One lifetime.** `FILE_TTL_HOURS` (default `36`) decides when a converted video is deleted and when it disappears from the room's list — the countdown in the "Your recent conversions" panel shows the same time. The cleanup sweep follows the same number, so there is a single place to change it.
 
 Give `DOWNLOAD_DIR` its own filesystem with a quota, so a runaway download cannot take the API's disk with it. Watch the free space and the `Disk cleanup removed ...` log line.
+
+### Rate limits
+
+Every limit is per client address per minute, and every one can be set in `server/.env`:
+
+| Setting | Default | What it covers |
+|---|---|---|
+| `API_RATE_LIMIT_PER_MIN` | 120 | everything under `/api` |
+| `AUTH_RATE_LIMIT_PER_MIN` | 20 | `/api/auth`, so signing in and the session check |
+| `DRIVE_RATE_LIMIT_PER_MIN` | 30 | `/api/drive`, so the Picker token and Drive calls |
+| `JOBS_RATE_LIMIT_PER_MIN` | 20 | starting and converting jobs |
+| `MEDIA_RATE_LIMIT_PER_MIN` | 600 | `/api/stream`, the media route |
+
+The media route is **excluded** from the API limit: it streams bytes rather than API calls, and counting its range requests used to let one viewer exhaust the budget and rate limit the session check. It has its own, much larger budget instead.
+
+Raise `AUTH_RATE_LIMIT_PER_MIN` when many people share one address (an office behind one NAT), otherwise their sign-ins rate limit each other.
+
+### Deploying
+
+The frontend is static and goes to Vercel; the API is a Node service on a VM. Before the first deploy:
+
+- **Frontend** (`Vercel`): set `VITE_API_URL=https://api.your-domain.example` (the documented name; `VITE_CONVERT_API_URL` is only a local alias), plus the Google and Supabase values. `vercel.json` already rewrites every path to `index.html`, so the room routes work on a refresh.
+- **Backend** (`server/.env`): set `NODE_ENV=production`, `PUBLIC_BASE_URL=https://api.your-domain.example`, `FRONTEND_ORIGINS=https://your-app.vercel.app` (exact origin, no wildcards), and `GOOGLE_REDIRECT_URI=https://api.your-domain.example/api/auth/google/callback` — which must also be added to the Google Cloud console's authorized redirect URIs.
+- **Disk**: `DATA_DIR` and `DOWNLOAD_DIR` must be on a persistent, private filesystem. `DATA_DIR` holds the encrypted Drive tokens and the stream registry; `DOWNLOAD_DIR` holds the converted files. Neither may be an ephemeral container filesystem, or the registry and every conversion are lost on a restart.
+- **One instance.** The stream registry and the job store are files on that machine. With more than one API instance behind a load balancer, a stream created on one is unknown to the other.
+- **Firewall**: allow inbound TCP on the API port from the internet, and nothing else. The API refuses to start in production without `PUBLIC_BASE_URL`, and refuses a `PUBLIC_BASE_URL` that points at localhost.
 
 ### Caddy stream proxy
 

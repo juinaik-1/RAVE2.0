@@ -60,35 +60,50 @@ app.use(express.json({ limit: "128kb" }));
 
 const authLimiter = rateLimit({
   windowMs: 60_000,
-  limit: 10,
+  limit: config.rateLimits.auth,
   standardHeaders: "draft-7",
   legacyHeaders: false,
   message: { error: "Too many authentication attempts. Try again shortly." },
 });
 const driveLimiter = rateLimit({
   windowMs: 60_000,
-  limit: 30,
+  limit: config.rateLimits.drive,
   standardHeaders: "draft-7",
   legacyHeaders: false,
   message: { error: "Too many Google Drive requests. Try again shortly." },
 });
 const jobsLimiter = rateLimit({
   windowMs: 60_000,
-  limit: 20,
+  limit: config.rateLimits.jobs,
   standardHeaders: "draft-7",
   legacyHeaders: false,
   message: { error: "Too many conversion requests. Try again shortly." },
 });
-const apiLimiter = rateLimit({
+// The media route streams bytes, not API calls. It has its own and much
+// larger budget, and it is skipped by the API limiter below, so one viewer
+// pulling a video cannot exhaust the budget for everyone else behind the same
+// address.
+const mediaLimiter = rateLimit({
   windowMs: 60_000,
-  limit: 120,
+  limit: config.rateLimits.media,
   standardHeaders: "draft-7",
   legacyHeaders: false,
+  message: { error: "Too many stream requests. Try again shortly." },
+});
+const apiLimiter = rateLimit({
+  windowMs: 60_000,
+  limit: config.rateLimits.api,
+  standardHeaders: "draft-7",
+  legacyHeaders: false,
+  // Range requests for the media are not API calls. Counting them used to let
+  // a single viewer exhaust the budget and rate limit the session check.
+  skip: (req) => req.path.startsWith("/stream/"),
   message: { error: "Too many API requests. Try again shortly." },
 });
 
 app.use("/api/auth", authLimiter);
 app.use("/api/drive", driveLimiter);
+app.use("/api/stream", mediaLimiter);
 app.use("/api", apiLimiter);
 app.use("/api", (req, res, next) => {
   if (req.method === "OPTIONS") return next();

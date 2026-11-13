@@ -38,9 +38,9 @@ export default function VideoPlayer({
   const playingRef = useRef(false);
   // The engine calls play() and pause() itself, and the browser reports those
   // as play and pause events as well. The event can arrive after the room
-  // state has already changed, so it is matched against the engine's own
-  // call here. Reporting it as a user action would make the room start or
-  // stop playing on its own.
+  // state has already changed, so each call is marked separately and the
+  // matching event consumes the mark. Reporting one as a user action would
+  // make the room start or stop playing on its own.
   const programmaticPlayAtRef = useRef(0);
   const programmaticPauseAtRef = useRef(0);
   const markProgrammaticPlay = useCallback(() => {
@@ -314,8 +314,8 @@ export default function VideoPlayer({
                   }
                   // The engine started the player itself.
                   if (consumeProgrammaticEvent('play')) return;
-                  // The room already believes the video is playing, so there is
-                  // nothing to change.
+                  // The room already believes the video is playing, so there
+                  // is nothing to change.
                   if (playing) return;
                   // A viewer without control must follow the host's play state.
                   if (!canControl) {
@@ -376,8 +376,8 @@ export default function VideoPlayer({
                 if (activated) setPlayerMuted(false);
                 // The engine started the player itself.
                 if (consumeProgrammaticEvent('play')) return;
-                // The room already believes the video is playing, so there is
-                // nothing to change.
+                // The room already believes the video is playing, so there
+                // is nothing to change.
                 if (playing) return;
                 // A viewer without control must follow the host's play state.
                 if (!canControl) {
