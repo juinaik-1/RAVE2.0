@@ -115,7 +115,7 @@ if (publicBaseUrl) {
   }
 }
 
-const allowedEmails = required('ALLOWED_EMAILS')
+const allowedEmails = (process.env.ALLOWED_EMAILS || '')
   .split(',')
   .map((email) => email.trim().toLowerCase())
   .filter(Boolean);

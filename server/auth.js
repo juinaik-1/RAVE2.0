@@ -23,7 +23,7 @@ export async function authenticateGoogleIdToken(idToken) {
   }
 
   const email = payload.email.toLowerCase();
-  if (!config.allowedEmails.has(email)) {
+  if (config.allowedEmails.size > 0 && !config.allowedEmails.has(email)) {
     const error = new Error('This Google account is not allowed to use Nook.');
     error.status = 403;
     throw error;
